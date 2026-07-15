@@ -433,7 +433,7 @@ static void draw_now_announce(pax_buf_t *buffer, const audio_player_snapshot_t *
     if (elapsed < .12f || elapsed > 4.6f || !buffer->buf_16bpp) return;
     if (strcmp(announce_path, player->path) != 0 && !build_announce_pixels(buffer, player)) return;
 
-    int top = 274 + (int)(analysis->bass * 4.0f);
+    int top = 210 + (int)(analysis->bass * 4.0f);
     size_t raw_width = buffer->width;
     for (size_t i = 0; i < announce_pixel_count; i++) {
         int x = announce_pixels[i].x;
@@ -465,7 +465,9 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
                            overlay_channels != player.channels || overlay_effect != active_effect ||
                            strcmp(overlay_path, player.path) != 0;
     if (overlay_changed) {
-        if (track_changed) now_announce_start = esp_timer_get_time();
+        if (track_changed) {
+            now_announce_start = now_card_visible ? 0 : esp_timer_get_time();
+        }
         overlay_signature_valid = true;
         overlay_state = player.state;
         overlay_sample_rate = player.sample_rate;
@@ -481,6 +483,7 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
         now_card_valid[framebuffer_index] = true;
     }
     if (now_card_visible) {
+        now_announce_start = 0;
         pax_col_t accent = effects_palette_color(.82f, analysis.beat_strength);
         pax_col_t secondary = effects_palette_color(.42f, analysis.beat_strength * .5f);
         int trace_width = 42 + (int)(analysis.bass * 122.0f);
@@ -889,7 +892,7 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
         } else if (key == BSP_INPUT_NAVIGATION_KEY_F4 || key == BSP_INPUT_NAVIGATION_KEY_MENU) {
             now_card_visible = !now_card_visible;
             effects_set_overlay_visible(now_card_visible);
-            if (!now_card_visible) now_announce_start = esp_timer_get_time();
+            now_announce_start = now_card_visible ? 0 : esp_timer_get_time();
             now_card_valid[0] = false;
             now_card_valid[1] = false;
         } else if (key == BSP_INPUT_NAVIGATION_KEY_ESC || key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
