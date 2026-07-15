@@ -27,6 +27,7 @@ void        effects_previous(void);
 void        effects_select(effect_id_t effect);
 effect_id_t effects_current(void);
 const char *effects_name(void);
+pax_col_t   effects_palette_color(float position, float accent);
 void        effects_set_overlay_visible(bool visible);
 void        effects_set_intensity(uint8_t intensity);
 void        effects_render(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, float dt);

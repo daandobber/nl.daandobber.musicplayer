@@ -15,10 +15,10 @@
 #define TWO_PI       6.28318530718f
 #define EFFECT_TOP   0
 #define EFFECT_BOTTOM 0
-#define CARD_X       390
-#define CARD_Y       344
-#define CARD_W       394
-#define CARD_H       120
+#define CARD_X       408
+#define CARD_Y       350
+#define CARD_W       376
+#define CARD_H       114
 #define STAR_COUNT   96
 
 typedef struct {
@@ -112,6 +112,10 @@ static pax_col_t global_palette_color(float position, float accent) {
     int green = (int)(((a >> 8) & 255) * (1.0f - mix) + ((b >> 8) & 255) * mix);
     int blue = (int)((a & 255) * (1.0f - mix) + (b & 255) * mix);
     return pax_col_rgb(red, green, blue);
+}
+
+pax_col_t effects_palette_color(float position, float accent) {
+    return global_palette_color(position, accent);
 }
 
 static void update_global_palette(const audio_analysis_snapshot_t *audio, float dt) {
@@ -1619,7 +1623,15 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
     }
 }
 
-static void render_algorithmic_morph(pax_buf_t *buffer) {
+static inline uint16_t mix_rgb565(uint16_t old_color, uint16_t new_color, int mix) {
+    int inverse = 32 - mix;
+    int red = ((((old_color >> 11) & 31) * inverse) + (((new_color >> 11) & 31) * mix)) >> 5;
+    int green = ((((old_color >> 5) & 63) * inverse) + (((new_color >> 5) & 63) * mix)) >> 5;
+    int blue = (((old_color & 31) * inverse) + ((new_color & 31) * mix)) >> 5;
+    return (uint16_t)((red << 11) | (green << 5) | blue);
+}
+
+static void render_algorithmic_morph(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio) {
     if (!morph_start || !morph_pixels || !buffer->buf_16bpp) return;
     float progress = (esp_timer_get_time() - morph_start) / 2400000.0f;
     if (progress >= 1.0f) { morph_start = 0; return; }
@@ -1643,27 +1655,35 @@ static void render_algorithmic_morph(pax_buf_t *buffer) {
                 y < CARD_Y + CARD_H && y + EFFECT_PIXEL > CARD_Y) continue;
             size_t index = (y / EFFECT_PIXEL) * grid_width + x / EFFECT_PIXEL;
             float radius = radial_lut ? radial_lut[index] : 0.0f;
-            uint32_t hash = (uint32_t)(x / EFFECT_PIXEL) * 73856093u ^
-                            (uint32_t)(y / EFFECT_PIXEL) * 19349663u ^
-                            (uint32_t)morph_sequence * 83492791u;
-            hash ^= hash >> 13;
-            hash *= 1274126177u;
-            hash ^= hash >> 16;
-            float noise = (hash & 255u) / 255.0f;
-            float liquid = fast_sin(x * .018f + y * .014f + flow_phase) * .5f + .5f;
-            float threshold = clamp01(noise * .58f + liquid * .42f);
-            if (progress >= threshold) continue;
+            size_t current_offset = x * raw_width + (raw_width - 1 - y);
+            uint16_t new_raw = buffer->buf_16bpp[current_offset];
+            float new_energy = (((new_raw >> 11) & 31) + ((new_raw >> 6) & 31) +
+                                (new_raw & 31)) / 93.0f;
 
             float dx = x - cx, dy = y - cy;
-            float swirl = warp * 20.0f / (radius + 18.0f);
-            float sx_float = x + row_flow * warp * 24.0f - dy * swirl;
-            float sy_float = y + column_flow[x / EFFECT_PIXEL] * warp * 18.0f + dx * swirl;
+            float interaction = (new_energy - .5f) * (18.0f + audio->bass * 22.0f);
+            float swirl = warp * (20.0f + interaction) / (radius + 18.0f);
+            float sx_float = x + row_flow * warp * (22.0f + interaction * .35f) - dy * swirl;
+            float sy_float = y + column_flow[x / EFFECT_PIXEL] * warp *
+                                 (17.0f + interaction * .28f) + dx * swirl;
             int sx = (int)sx_float, sy = (int)sy_float;
             if (sx < 0) sx = 0; else if (sx >= (int)screen_width) sx = screen_width - 1;
             if (sy < 0) sy = 0; else if (sy >= (int)screen_height) sy = screen_height - 1;
 
             uint16_t old_raw = morph_pixels[(size_t)sx * raw_width + (raw_width - 1 - (size_t)sy)];
-            fill_effect_cell_raw(buffer, x, y, old_raw);
+            float old_energy = (((old_raw >> 11) & 31) + ((old_raw >> 6) & 31) +
+                                (old_raw & 31)) / 93.0f;
+            float interference = fast_sin((new_energy - old_energy) * 7.0f +
+                                          x * .011f - y * .009f + flow_phase);
+            float local_mix = clamp01(progress + (new_energy - old_energy) * warp * .24f +
+                                      interference * warp * (.08f + audio->mid * .06f));
+            local_mix = local_mix * local_mix * (3.0f - 2.0f * local_mix);
+            uint16_t coupled = mix_rgb565(old_raw, new_raw, (int)(local_mix * 32.0f));
+
+            // Feeding the coupled result back makes the old field evolve under
+            // the geometry of the incoming algorithm instead of remaining a snapshot.
+            morph_pixels[current_offset] = coupled;
+            fill_effect_cell_raw(buffer, x, y, coupled);
         }
     }
 }
@@ -1704,7 +1724,7 @@ void effects_render(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, f
             }
             break;
     }
-    render_algorithmic_morph(buffer);
+    render_algorithmic_morph(buffer, audio);
     previous_buffer = buffer;
     previous_effect = current_effect;
 }

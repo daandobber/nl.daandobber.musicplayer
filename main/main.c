@@ -31,10 +31,10 @@
 #define COLOR_ACCENT   0xff4de0b5
 #define COLOR_SELECTED 0xff274b55
 #define COLOR_ERROR    0xffff6b7a
-#define NOW_CARD_X      390
-#define NOW_CARD_Y      344
-#define NOW_CARD_W      394
-#define NOW_CARD_H      120
+#define NOW_CARD_X      408
+#define NOW_CARD_Y      350
+#define NOW_CARD_W      376
+#define NOW_CARD_H      114
 
 static const char *TAG = "musicplayer";
 
@@ -93,6 +93,7 @@ static uint32_t overlay_sample_rate;
 static uint8_t overlay_channels;
 static effect_id_t overlay_effect;
 static char overlay_path[AUDIO_PLAYER_PATH_MAX];
+static int64_t now_announce_start;
 
 static pax_orientation_t display_orientation(void) {
     switch (bsp_display_get_default_rotation()) {
@@ -303,13 +304,18 @@ static const char *state_name(audio_player_state_t state) {
     }
 }
 
-static uint32_t text_hash(const char *text) {
-    uint32_t hash = 2166136261u;
-    while (text && *text) {
-        hash ^= (uint8_t)*text++;
-        hash *= 16777619u;
-    }
-    return hash;
+static pax_col_t color_scale(pax_col_t color, float scale) {
+    if (scale < 0.0f) scale = 0.0f;
+    if (scale > 1.0f) scale = 1.0f;
+    return pax_col_rgb((int)(((color >> 16) & 255) * scale),
+                       (int)(((color >> 8) & 255) * scale),
+                       (int)((color & 255) * scale));
+}
+
+static pax_col_t color_alpha(pax_col_t color, float alpha) {
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    return ((uint32_t)(alpha * 255.0f) << 24) | (color & 0x00ffffff);
 }
 
 static void draw_now_card(pax_buf_t *buffer, const audio_player_snapshot_t *player) {
@@ -319,46 +325,104 @@ static void draw_now_card(pax_buf_t *buffer, const audio_player_snapshot_t *play
     const char *artist_source = metadata ? metadata->artist : "Unknown artist";
     const char *album_source = metadata ? metadata->album : "Unknown album";
 
-    pax_simple_rect(buffer, 0xff07101a, NOW_CARD_X, NOW_CARD_Y, NOW_CARD_W, NOW_CARD_H);
-    pax_simple_rect(buffer, COLOR_ACCENT, NOW_CARD_X, NOW_CARD_Y, NOW_CARD_W, 2);
-    pax_simple_rect(buffer, COLOR_ACCENT, NOW_CARD_X, NOW_CARD_Y + NOW_CARD_H - 2, NOW_CARD_W, 2);
-    pax_simple_rect(buffer, COLOR_ACCENT, NOW_CARD_X, NOW_CARD_Y, 2, NOW_CARD_H);
-    pax_simple_rect(buffer, COLOR_ACCENT, NOW_CARD_X + NOW_CARD_W - 2, NOW_CARD_Y, 2, NOW_CARD_H);
+    pax_col_t accent = effects_palette_color(.82f, 0.0f);
+    pax_col_t secondary = effects_palette_color(.42f, 0.0f);
+    pax_simple_rect(buffer, 0xff010207, NOW_CARD_X + 5, NOW_CARD_Y + 5, NOW_CARD_W, NOW_CARD_H);
+    pax_simple_rect(buffer, 0xff080a13, NOW_CARD_X, NOW_CARD_Y, NOW_CARD_W, NOW_CARD_H);
+    pax_simple_rect(buffer, 0xff0d1020, NOW_CARD_X + 5, NOW_CARD_Y + 5, NOW_CARD_W - 10, NOW_CARD_H - 10);
+    pax_simple_rect(buffer, color_scale(secondary, .26f), NOW_CARD_X + 5, NOW_CARD_Y + 5,
+                    NOW_CARD_W - 10, 18);
+    pax_simple_rect(buffer, accent, NOW_CARD_X, NOW_CARD_Y + 9, 4, NOW_CARD_H - 18);
+    pax_simple_rect(buffer, color_scale(accent, .62f), NOW_CARD_X + 4, NOW_CARD_Y + 9, 2,
+                    NOW_CARD_H - 18);
+    pax_simple_rect(buffer, accent, NOW_CARD_X + 15, NOW_CARD_Y, 52, 2);
+    pax_simple_rect(buffer, secondary, NOW_CARD_X + NOW_CARD_W - 74, NOW_CARD_Y + NOW_CARD_H - 2, 58, 2);
 
-    const int art_x = NOW_CARD_X + 14;
-    const int art_y = NOW_CARD_Y + 13;
-    const int art_size = NOW_CARD_H - 26;
-    uint32_t hash = text_hash(album_source) ^ (text_hash(artist_source) << 1);
-    uint8_t hue = (uint8_t)hash;
+    const int art_x = NOW_CARD_X + 13;
+    const int art_y = NOW_CARD_Y + 12;
+    const int art_size = NOW_CARD_H - 24;
+    pax_simple_rect(buffer, color_scale(accent, .65f), art_x - 2, art_y - 2, art_size + 4, art_size + 4);
     if (!metadata || !album_art_draw(buffer, metadata, art_x, art_y, art_size)) {
-        pax_simple_rect(buffer, pax_col_hsv(hue, 205, 125), art_x, art_y, art_size, art_size);
+        pax_simple_rect(buffer, color_scale(secondary, .48f), art_x, art_y, art_size, art_size);
         for (int stripe = 0; stripe < 5; stripe++) {
             int stripe_y = art_y + 8 + stripe * 17;
-            pax_simple_rect(buffer, pax_col_hsv(hue + stripe * 19, 230, 75 + stripe * 22),
+            pax_simple_rect(buffer, color_scale(stripe & 1 ? accent : secondary, .45f + stripe * .10f),
                             art_x + 7, stripe_y, art_size - 14, 8);
         }
         float disc_x = art_x + art_size * 0.62f;
         float disc_y = art_y + art_size * 0.52f;
         pax_simple_circle(buffer, 0xffe8edf5, disc_x, disc_y, art_size * 0.34f);
-        pax_simple_circle(buffer, pax_col_hsv(hue + 90, 150, 195), disc_x, disc_y, art_size * 0.24f);
-        pax_simple_circle(buffer, 0xff07101a, disc_x, disc_y, art_size * 0.065f);
+        pax_simple_circle(buffer, secondary, disc_x, disc_y, art_size * 0.24f);
+        pax_simple_circle(buffer, 0xff080a13, disc_x, disc_y, art_size * 0.065f);
     }
 
-    const int text_x = art_x + art_size + 20;
+    const int text_x = art_x + art_size + 17;
     char album[52], title[52], artist[52];
-    clipped_text(album, sizeof(album), album_source, 34);
-    clipped_text(title, sizeof(title), title_source, 18);
-    clipped_text(artist, sizeof(artist), artist_source, 18);
-    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, text_x, NOW_CARD_Y + 12, album);
-    pax_draw_text(buffer, COLOR_TEXT, pax_font_sky_mono, 18, text_x, NOW_CARD_Y + 31, title);
-    pax_draw_text(buffer, COLOR_ACCENT, pax_font_sky_mono, 18, text_x, NOW_CARD_Y + 57, artist);
+    clipped_text(album, sizeof(album), album_source, 28);
+    clipped_text(title, sizeof(title), title_source, 20);
+    clipped_text(artist, sizeof(artist), artist_source, 22);
+    pax_draw_text(buffer, color_scale(secondary, .88f), pax_font_sky_mono, 9,
+                  text_x, NOW_CARD_Y + 9, "MILKDRIP // NOW PLAYING");
+    pax_draw_text(buffer, COLOR_TEXT, pax_font_sky_mono, 19, text_x, NOW_CARD_Y + 30, title);
+    pax_draw_text(buffer, accent, pax_font_sky_mono, 14, text_x, NOW_CARD_Y + 56, artist);
+    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, text_x, NOW_CARD_Y + 77, album);
 
-    char detail[80];
-    snprintf(detail, sizeof(detail), "%s // MILKDRIP: %s // %lu Hz", state_name(player->state), effects_name(),
-             (unsigned long)player->sample_rate);
-    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, text_x, NOW_CARD_Y + 84, detail);
-    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, NOW_CARD_X + NOW_CARD_W - 128,
-                  NOW_CARD_Y + 101, "VOL");
+    char detail[64];
+    snprintf(detail, sizeof(detail), "%s  //  %s", state_name(player->state), effects_name());
+    pax_draw_text(buffer, color_scale(accent, .72f), pax_font_sky_mono, 9,
+                  text_x, NOW_CARD_Y + 96, detail);
+}
+
+static void draw_now_announce(pax_buf_t *buffer, const audio_player_snapshot_t *player,
+                              const audio_analysis_snapshot_t *analysis) {
+    float elapsed = (esp_timer_get_time() - now_announce_start) / 1000000.0f;
+    if (elapsed < 0.0f || elapsed > 5.2f) return;
+    float visibility = elapsed < .45f ? elapsed / .45f :
+                       (elapsed > 3.8f ? (5.2f - elapsed) / 1.4f : 1.0f);
+    visibility *= visibility * (3.0f - 2.0f * visibility);
+
+    size_t library_track = media_library_find_path(&library, player->path);
+    const media_track_t *metadata = library_track != SIZE_MAX ? &library.tracks[library_track] : NULL;
+    const char *title_source = metadata ? metadata->title : media_library_display_name(player->path);
+    const char *artist_source = metadata ? metadata->artist : "Unknown artist";
+    const char *album_source = metadata ? metadata->album : "";
+    char title[64], artist[64], album[64];
+    clipped_text(title, sizeof(title), title_source, 34);
+    clipped_text(artist, sizeof(artist), artist_source, 38);
+    clipped_text(album, sizeof(album), album_source, 42);
+
+    pax_col_t accent = effects_palette_color(.82f, analysis->beat_strength);
+    pax_col_t secondary = effects_palette_color(.38f, analysis->beat_strength * .5f);
+    float pulse = .72f + analysis->bass * .28f;
+    int center = pax_buf_get_width(buffer) / 2;
+    int baseline = 338 + (int)(analysis->bass * 7.0f);
+    for (int band = 0; band < AUDIO_ANALYSIS_BANDS; band++) {
+        float strength = analysis->bands[band];
+        int length = 18 + (int)(strength * 88.0f);
+        int y = baseline - 38 + band * 6;
+        pax_simple_rect(buffer, color_alpha(band & 1 ? accent : secondary, visibility * .18f),
+                        center - 260 - length, y, length, 2);
+        pax_simple_rect(buffer, color_alpha(band & 1 ? secondary : accent, visibility * .18f),
+                        center + 260, y, length, 2);
+    }
+
+    pax_vec2f title_size = pax_text_size(pax_font_sky_mono, 29, title);
+    pax_vec2f artist_size = pax_text_size(pax_font_sky_mono, 17, artist);
+    pax_vec2f album_size = pax_text_size(pax_font_sky_mono, 9, album);
+    float title_x = center - title_size.x * .5f;
+    pax_draw_text(buffer, color_alpha(0xff000000, visibility * .72f), pax_font_sky_mono, 29,
+                  title_x + 3, baseline + 3, title);
+    pax_draw_text(buffer, color_alpha(COLOR_TEXT, visibility * pulse), pax_font_sky_mono, 29,
+                  title_x, baseline, title);
+    pax_draw_text(buffer, color_alpha(accent, visibility), pax_font_sky_mono, 17,
+                  center - artist_size.x * .5f, baseline + 39, artist);
+    if (album[0]) {
+        pax_draw_text(buffer, color_alpha(secondary, visibility * .78f), pax_font_sky_mono, 9,
+                      center - album_size.x * .5f, baseline + 65, album);
+    }
+    int line = 54 + (int)(analysis->rms * 170.0f);
+    pax_simple_rect(buffer, color_alpha(accent, visibility * .8f), center - line, baseline - 12,
+                    line * 2, 2);
 }
 
 static void render_now_playing(pax_buf_t *buffer, float dt) {
@@ -377,11 +441,13 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
     effect_time_total += overlay_start - stage_start;
 
     effect_id_t active_effect = effects_current();
+    bool track_changed = !overlay_signature_valid || strcmp(overlay_path, player.path) != 0;
     bool overlay_changed = !overlay_signature_valid || overlay_state != player.state ||
                            overlay_sample_rate != player.sample_rate ||
                            overlay_channels != player.channels || overlay_effect != active_effect ||
                            strcmp(overlay_path, player.path) != 0;
     if (overlay_changed) {
+        if (track_changed) now_announce_start = esp_timer_get_time();
         overlay_signature_valid = true;
         overlay_state = player.state;
         overlay_sample_rate = player.sample_rate;
@@ -397,12 +463,30 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
         now_card_valid[framebuffer_index] = true;
     }
     if (now_card_visible) {
-        int active_segments = (player.volume + 9) / 10;
-        for (int segment = 0; segment < 10; segment++) {
-            pax_col_t color = segment < active_segments ? COLOR_ACCENT : 0xff303746;
-            pax_simple_rect(buffer, color, NOW_CARD_X + NOW_CARD_W - 104 + segment * 9,
-                            NOW_CARD_Y + 101, 6, 7);
+        pax_col_t accent = effects_palette_color(.82f, analysis.beat_strength);
+        pax_col_t secondary = effects_palette_color(.42f, analysis.beat_strength * .5f);
+        int trace_width = 42 + (int)(analysis.bass * 122.0f);
+        pax_simple_rect(buffer, 0xff0d1020, NOW_CARD_X + 15, NOW_CARD_Y,
+                        170, 2);
+        pax_simple_rect(buffer, 0xff0d1020, NOW_CARD_X + NOW_CARD_W - 124,
+                        NOW_CARD_Y + 6, 100, 17);
+        pax_simple_rect(buffer, accent, NOW_CARD_X + 15, NOW_CARD_Y, trace_width, 2);
+        for (int band = 0; band < AUDIO_ANALYSIS_BANDS; band++) {
+            int height = 2 + (int)(analysis.bands[band] * 12.0f);
+            pax_simple_rect(buffer, band & 1 ? accent : secondary,
+                            NOW_CARD_X + NOW_CARD_W - 122 + band * 8,
+                            NOW_CARD_Y + 22 - height, 5, height);
         }
+        int active_segments = (player.volume + 9) / 10;
+        pax_draw_text(buffer, color_scale(secondary, .75f), pax_font_sky_mono, 9,
+                      NOW_CARD_X + NOW_CARD_W - 132, NOW_CARD_Y + NOW_CARD_H - 14, "VOL");
+        for (int segment = 0; segment < 10; segment++) {
+            pax_col_t color = segment < active_segments ? accent : 0xff303746;
+            pax_simple_rect(buffer, color, NOW_CARD_X + NOW_CARD_W - 104 + segment * 9,
+                            NOW_CARD_Y + NOW_CARD_H - 13, 6, 6);
+        }
+    } else {
+        draw_now_announce(buffer, &player, &analysis);
     }
     if (player.state == AUDIO_PLAYER_ERROR) {
         int width = pax_buf_get_width(buffer);
@@ -787,6 +871,7 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
         } else if (key == BSP_INPUT_NAVIGATION_KEY_F4 || key == BSP_INPUT_NAVIGATION_KEY_MENU) {
             now_card_visible = !now_card_visible;
             effects_set_overlay_visible(now_card_visible);
+            if (!now_card_visible) now_announce_start = esp_timer_get_time();
             now_card_valid[0] = false;
             now_card_valid[1] = false;
         } else if (key == BSP_INPUT_NAVIGATION_KEY_ESC || key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
