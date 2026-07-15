@@ -30,7 +30,7 @@ typedef struct {
 
 static size_t        screen_width;
 static size_t        screen_height;
-static effect_id_t   current_effect = EFFECT_PROCEDURAL_FIRST + 28;
+static effect_id_t   current_effect = EFFECT_PROCEDURAL_FIRST + 48;
 static float         phase;
 static uint8_t       hue;
 static uint32_t      last_beat;
@@ -42,6 +42,11 @@ static float        *reaction_a;
 static float        *reaction_b;
 static float        *reaction_next_a;
 static float        *reaction_next_b;
+static uint8_t      *mind_cells;
+static uint8_t      *mind_next;
+static uint32_t      mind_lfsr = 0x6d2b79f5u;
+static uint32_t      mind_last_beat;
+static float         mind_step_time;
 static size_t        grid_width;
 static size_t        grid_height;
 static bool          overlay_visible = true;
@@ -50,8 +55,9 @@ static pax_buf_t    *previous_buffer;
 static effect_id_t   previous_effect = EFFECT_COUNT;
 static uint16_t     *morph_pixels;
 static int64_t       morph_start;
-static uint8_t       morph_mode;
 static uint8_t       morph_sequence;
+static float         palette_cursor;
+static uint32_t      palette_last_beat;
 
 typedef struct { float x, y, z; } effect_star_t;
 static effect_star_t stars[STAR_COUNT];
@@ -60,6 +66,60 @@ static float clamp01(float value) {
     if (value < 0.0f) return 0.0f;
     if (value > 1.0f) return 1.0f;
     return value;
+}
+
+static const uint32_t palette_colors[][3] = {
+    {0x05000c, 0x7115a8, 0xffc8ff}, {0x090000, 0xc3260b, 0xffd05a},
+    {0x000817, 0x075ca8, 0x72f1ff}, {0x090700, 0x8f6500, 0xfff1a6},
+    {0x001316, 0x148d89, 0xe5fff4}, {0x110015, 0xb00074, 0xff93d7},
+    {0x03030a, 0x3a36b8, 0x63ff9b}, {0x001006, 0x168843, 0xffd75a},
+    {0x000000, 0x570000, 0xff3030}, {0x100100, 0xe13b00, 0xffe063},
+    {0x000513, 0x083d91, 0xb8e8ff}, {0x030506, 0x69767d, 0xffffff},
+    {0x09040d, 0x44265c, 0xd7a6e8}, {0x071000, 0x76a600, 0xeaff8b},
+    {0x100b00, 0x9b4d12, 0xf4d6a0}, {0x000d10, 0x007e92, 0x4dffe1},
+    {0x0d0010, 0x5c168f, 0xff6e47}, {0x020c05, 0x2b7244, 0xa6ffcf},
+};
+
+static pax_col_t palette_sample(size_t palette, float position, float accent) {
+    size_t count = sizeof(palette_colors) / sizeof(palette_colors[0]);
+    const uint32_t *stops = palette_colors[palette % count];
+    float p = clamp01(position);
+    int segment = p >= .5f;
+    float mix = segment ? (p - .5f) * 2.0f : p * 2.0f;
+    uint32_t a = stops[segment], b = stops[segment + 1];
+    int ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+    int red = ar + (int)((((b >> 16) & 255) - ar) * mix);
+    int green = ag + (int)((((b >> 8) & 255) - ag) * mix);
+    int blue = ab + (int)(((b & 255) - ab) * mix);
+    float flash = accent * .16f;
+    red += (int)((255 - red) * flash);
+    green += (int)((255 - green) * flash);
+    blue += (int)((255 - blue) * flash);
+    return pax_col_rgb(red, green, blue);
+}
+
+static pax_col_t global_palette_color(float position, float accent) {
+    size_t count = sizeof(palette_colors) / sizeof(palette_colors[0]);
+    float wrapped = fmodf(palette_cursor, (float)count);
+    if (wrapped < 0) wrapped += count;
+    size_t first = (size_t)wrapped;
+    size_t second = (first + 1) % count;
+    float mix = wrapped - first;
+    mix = mix * mix * (3.0f - 2.0f * mix);
+    pax_col_t a = palette_sample(first, position, accent);
+    pax_col_t b = palette_sample(second, position, accent);
+    int red = (int)(((a >> 16) & 255) * (1.0f - mix) + ((b >> 16) & 255) * mix);
+    int green = (int)(((a >> 8) & 255) * (1.0f - mix) + ((b >> 8) & 255) * mix);
+    int blue = (int)((a & 255) * (1.0f - mix) + (b & 255) * mix);
+    return pax_col_rgb(red, green, blue);
+}
+
+static void update_global_palette(const audio_analysis_snapshot_t *audio, float dt) {
+    palette_cursor += dt * (.040f + audio->treble * .028f);
+    if (audio->beat_counter != palette_last_beat) {
+        palette_cursor += audio->beat_strength * .018f;
+        palette_last_beat = audio->beat_counter;
+    }
 }
 
 static void effect_rect(pax_buf_t *buffer, pax_col_t color, float x, float y, float width, float height) {
@@ -120,6 +180,9 @@ void effects_init(size_t width, size_t height) {
             reaction_b[i] = reaction_next_b[i] = 0.0f;
         }
     }
+    free(mind_cells); free(mind_next);
+    mind_cells = calloc(cells, sizeof(uint8_t));
+    mind_next = calloc(cells, sizeof(uint8_t));
     for (size_t i = 0; i < BALL_COUNT; i++) {
         balls[i].x = width * (0.2f + i * 0.3f);
         balls[i].y = height * (0.25f + (i & 1) * 0.45f);
@@ -174,7 +237,7 @@ static void begin_morph(effect_id_t destination) {
     if (!snapshot) return;
     morph_pixels = snapshot;
     memcpy(morph_pixels, previous_buffer->buf_16bpp, pixels * sizeof(uint16_t));
-    morph_mode = morph_sequence++ & 3u;
+    morph_sequence++;
     morph_start = esp_timer_get_time();
 }
 
@@ -234,7 +297,9 @@ const char *effects_name(void) {
         "Diagonal silence", "Orbit fields", "Negative space", "Audio stripes",
         "Mondrian pulse", "Four colour blocks", "Sparse tunnel", "Twin suns",
         "Fractal caustics", "Voronoi checker", "Magnetic mandala", "Marble circuit",
-        "Crystal vortex", "Chemical geometry", "Mosaic fractal", "Infinite flora"
+        "Crystal vortex", "Chemical geometry", "Mosaic fractal", "Infinite flora",
+        "Mind Is Growing", "Copper tide", "Kefrens echoes", "Rotozoom tiles",
+        "Shadebob trails", "Scene twister"
     };
     if (current_effect < EFFECT_MILKDROP_FIRST) return legacy_names[current_effect];
     if (current_effect < EFFECT_PROCEDURAL_FIRST) return milk_names[current_effect - EFFECT_MILKDROP_FIRST];
@@ -267,9 +332,8 @@ static void render_plasma(pax_buf_t *buffer, const audio_analysis_snapshot_t *au
                                                  (float)y - screen_height * 0.5f);
             float v3 = fast_sin(distance / (26.0f - audio->bass * 8.0f) + phase);
             float mixed = (v1 + v2 + v3 + 3.0f) / 6.0f;
-            uint8_t cell_hue = hue + (uint8_t)(mixed * 150.0f) + (uint8_t)(audio->treble * 35.0f);
             uint8_t value = 35 + (uint8_t)(clamp01(mixed + audio->beat_strength * 0.35f) * 220.0f);
-            fill_effect_cell(buffer, x, y, pax_col_hsv(cell_hue, 230, value));
+            fill_effect_cell(buffer, x, y, global_palette_color(value / 255.0f, audio->beat_strength));
         }
     }
 }
@@ -317,9 +381,8 @@ static void render_metaballs(pax_buf_t *buffer, const audio_analysis_snapshot_t 
             if (field > 0.32f) {
                 float strength = clamp01((field - 0.32f) * 1.8f);
                 uint8_t value = 70 + strength * 185;
-                uint8_t saturation = 245 - audio->treble * 80;
                 fill_effect_cell(buffer, x, y,
-                                 pax_col_hsv(hue + (uint8_t)(field * 18), saturation, value));
+                                 global_palette_color(value / 255.0f, audio->beat_strength));
             }
         }
     }
@@ -338,8 +401,7 @@ static void render_spectrum(pax_buf_t *buffer, const audio_analysis_snapshot_t *
         float value = clamp01(audio->bands[i]);
         float height = fmaxf(3.0f, value * usable_height);
         float x = margin + i * (bar_width + gap);
-        uint8_t value_color = 110 + value * 145;
-        pax_col_t color = pax_col_hsv(hue + i * 13, 235, value_color);
+        pax_col_t color = global_palette_color(.35f + value * .65f, audio->beat_strength);
         effect_rect(buffer, 0xff101426, x, center - usable_height, bar_width, usable_height * 2);
         effect_rect(buffer, color, x, center - height, bar_width, height * 2);
     }
@@ -398,7 +460,7 @@ static void render_scope(pax_buf_t *buffer, const audio_analysis_snapshot_t *aud
         float strength = clamp01(audio->bands[band]);
         float height = 8.0f + strength * content_height * 0.32f;
         float x = band * band_width + 3.0f;
-        effect_rect(buffer, pax_col_hsv(hue + band * 11, 210, 45 + strength * 90), x,
+        effect_rect(buffer, global_palette_color(.12f + strength * .38f, audio->beat_strength), x,
                     center - height, band_width - 6.0f, height * 2.0f);
     }
 
@@ -413,9 +475,9 @@ static void render_scope(pax_buf_t *buffer, const audio_analysis_snapshot_t *aud
         int mirror = center - (int)(sample * amplitude * 0.72f);
         if (i > 0) {
             draw_effect_line(buffer, previous_x, previous_mirror, x, mirror,
-                             pax_col_hsv(hue + 165, 245, 105 + audio->treble * 90), 3);
+                             global_palette_color(.45f + audio->treble * .35f, audio->beat_strength), 3);
             draw_effect_line(buffer, previous_x, previous_y, x, y,
-                             pax_col_hsv(hue + 115, 180, 220 + audio->beat_strength * 35), 3);
+                             global_palette_color(.82f, audio->beat_strength), 3);
         }
         previous_x = x;
         previous_y = y;
@@ -438,8 +500,7 @@ static void render_tunnel(pax_buf_t *buffer, const audio_analysis_snapshot_t *au
             float rings = fast_sin(radius * (0.055f + audio->mid * 0.025f) - phase * 2.8f);
             float ribs = fast_sin(angle * (6.0f + audio->treble * 5.0f) + phase);
             float value = clamp01((rings + ribs + 1.4f) * 0.36f + audio->beat_strength * 0.28f);
-            fill_effect_cell(buffer, x, y, pax_col_hsv(hue + angle * 32.0f + radius * 0.12f, 245,
-                                                       25 + value * 230));
+            fill_effect_cell(buffer, x, y, global_palette_color(.08f + value * .92f, audio->beat_strength));
         }
     }
 }
@@ -460,7 +521,7 @@ static void render_radial(pax_buf_t *buffer, const audio_analysis_snapshot_t *au
         int x1 = cx + fast_sin(angle + TWO_PI * 0.25f) * outer;
         int y1 = cy + fast_sin(angle) * outer;
         draw_effect_line(buffer, x0, y0, x1, y1,
-                         pax_col_hsv(hue + band * 18, 240, 100 + strength * 155), 5);
+                         global_palette_color(.25f + strength * .75f, audio->beat_strength), 5);
     }
     if (audio->beat_counter != last_beat) { hue += 37; last_beat = audio->beat_counter; }
 }
@@ -481,7 +542,7 @@ static void render_starfield(pax_buf_t *buffer, const audio_analysis_snapshot_t 
         int y = cy + stars[i].y * 115.0f / stars[i].z;
         int size = stars[i].z < 0.18f ? 3 : (stars[i].z < 0.42f ? 2 : 1);
         uint16_t pixel = (uint16_t)buffer->col2buf(buffer,
-            pax_col_hsv(hue + i * 3, 100 + audio->treble * 130, 120 + (1.0f - stars[i].z) * 135));
+            global_palette_color(.35f + (1.0f - stars[i].z) * .65f, audio->beat_strength));
         for (int oy = -size; oy <= size; oy++) for (int ox = -size; ox <= size; ox++)
             set_effect_pixel(buffer, x + ox, y + oy, pixel);
     }
@@ -501,8 +562,7 @@ static void render_kaleido(pax_buf_t *buffer, const audio_analysis_snapshot_t *a
             float pattern = fast_sin(radius * 0.045f + folded * 3.0f - phase * 2.0f);
             float pulse = fast_sin(radius * 0.018f - phase) * audio->bass;
             float value = clamp01(0.42f + pattern * 0.38f + pulse * 0.3f + audio->beat_strength * 0.3f);
-            fill_effect_cell(buffer, x, y, pax_col_hsv(hue + folded * 55.0f + audio->mid * 60.0f,
-                                                       235, 20 + value * 235));
+            fill_effect_cell(buffer, x, y, global_palette_color(.06f + value * .94f, audio->beat_strength));
         }
     }
 }
@@ -517,7 +577,7 @@ static void render_fluid(pax_buf_t *buffer, const audio_analysis_snapshot_t *aud
             pax_col_t color;
             if (seed) {
                 float wave = (fast_sin(x * 0.018f + phase) + fast_sin(y * 0.025f - phase) + 2.0f) * 0.25f;
-                color = pax_col_hsv(hue + wave * 100.0f, 225, 25 + wave * 125.0f);
+                color = global_palette_color(.08f + wave * .55f, audio->beat_strength);
             } else {
                 float dx = x - cx;
                 float dy = y - cy;
@@ -533,15 +593,19 @@ static void render_fluid(pax_buf_t *buffer, const audio_analysis_snapshot_t *aud
                     uint16_t raw = previous_buffer->buf_16bpp[sx * previous_buffer->width +
                                                               (previous_buffer->width - 1 - sy)];
                     pax_col_t old = previous_buffer->buf2col(previous_buffer, raw);
-                    uint8_t red = (old >> 16) & 0xff;
-                    uint8_t green = (old >> 8) & 0xff;
-                    uint8_t blue = old & 0xff;
+                    int red = (old >> 16) & 0xff;
+                    int green = (old >> 8) & 0xff;
+                    int blue = old & 0xff;
                     float decay = 0.955f + audio->rms * 0.025f;
                     red *= decay; green *= decay; blue *= decay;
                     uint8_t injection = (uint8_t)(audio->beat_strength * 22.0f + audio->treble * 5.0f);
-                    if ((hue / 43) % 3 == 0) red = red + injection > 255 ? 255 : red + injection;
-                    else if ((hue / 43) % 3 == 1) green = green + injection > 255 ? 255 : green + injection;
-                    else blue = blue + injection > 255 ? 255 : blue + injection;
+                    pax_col_t injected = global_palette_color(.72f, audio->beat_strength);
+                    red += injection * ((injected >> 16) & 255) / 255;
+                    green += injection * ((injected >> 8) & 255) / 255;
+                    blue += injection * (injected & 255) / 255;
+                    if (red > 255) red = 255;
+                    if (green > 255) green = 255;
+                    if (blue > 255) blue = 255;
                     color = pax_col_rgb(red, green, blue);
                 }
             }
@@ -565,8 +629,9 @@ static void render_ribbons(pax_buf_t *buffer, const audio_analysis_snapshot_t *a
             float wave = fast_sin(x * 0.018f + phase * (1.0f + ribbon * 0.08f) + ribbon * 0.8f);
             int y = screen_height / 2 + offset + (int)(wave * amplitude * 0.55f + sample * amplitude);
             if (x > 0) draw_effect_line(buffer, previous_x, previous_y, x, y,
-                                        pax_col_hsv(hue + ribbon * 24, 215,
-                                                    105 + audio->bands[ribbon % AUDIO_ANALYSIS_BANDS] * 140), 3);
+                                        global_palette_color(.32f +
+                                            audio->bands[ribbon % AUDIO_ANALYSIS_BANDS] * .68f,
+                                            audio->beat_strength), 3);
             previous_x = x;
             previous_y = y;
         }
@@ -661,26 +726,12 @@ static const milk_field_preset_t milk_presets[64] = {
 
 static void milk_palette(uint8_t palette, float color_phase, int injection,
                          int *red, int *green, int *blue) {
-    float r = fast_sin(color_phase) * .5f + .5f;
-    float g = fast_sin(color_phase + 2.094f) * .5f + .5f;
-    float b = fast_sin(color_phase + 4.188f) * .5f + .5f;
-    switch (palette) {
-        case 1: r = r * r; g *= .45f; b = .35f + b * .65f; break;
-        case 2: r *= .30f; g = .25f + g * .75f; b = b * b; break;
-        case 3: r = .35f + r * .65f; g = .15f + g * .55f; b *= .25f; break;
-        case 4: r = .20f + b * .45f; g = .35f + r * .65f; b = .45f + g * .55f; break;
-        case 5: { float mono = (r + g + b) / 3.0f; r = mono; g = mono * .75f; b = 1.0f - mono * .35f; break; }
-        case 6: r *= .16f; g = .35f + g * .45f; b = .60f + b * .40f; break;             // ice
-        case 7: r = .55f + r * .45f; g = .12f + b * .55f; b = .38f + g * .62f; break; // candy
-        case 8: r = .70f + r * .30f; g = g * g * .55f; b *= .08f; break;               // fire
-        case 9: r *= .10f; g = .42f + g * .58f; b = .08f + b * .24f; break;            // toxic green
-        case 10: { float mono = r * .25f + g * .55f + b * .20f; r = mono; g = mono; b = mono; break; }
-        case 11: r = 1.0f - r * .55f; g = 1.0f - g * .55f; b = 1.0f - b * .55f; break; // bright CMY
-        default: break;
-    }
-    *red += (int)(injection * r);
-    *green += (int)(injection * g);
-    *blue += (int)(injection * b);
+    (void)palette;
+    float position = fast_sin(color_phase) * .5f + .5f;
+    pax_col_t color = global_palette_color(position, 0.0f);
+    *red += injection * ((color >> 16) & 255) / 255;
+    *green += injection * ((color >> 8) & 255) / 255;
+    *blue += injection * (color & 255) / 255;
 }
 
 static void render_milk_field(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, float dt,
@@ -704,7 +755,7 @@ static void render_milk_field(pax_buf_t *buffer, const audio_analysis_snapshot_t
             pax_col_t color;
             if (seed) {
                 float light = clamp01(0.24f + field * 0.22f + audio->rms * 0.5f);
-                color = pax_col_hsv(hue + preset->hue_offset + angle * 28.0f, 235, 12 + light * 190.0f);
+                color = global_palette_color(light, audio->beat_strength);
             } else {
                 float dx = x - cx;
                 float dy = y - cy;
@@ -896,44 +947,8 @@ static void render_milk_field(pax_buf_t *buffer, const audio_analysis_snapshot_t
     if (audio->beat_counter != last_beat) { hue += 2; last_beat = audio->beat_counter; }
 }
 
-static pax_col_t procedural_palette(uint8_t palette, float position, float accent) {
-    // Deliberately narrow three-stop palettes. Unlike HSV cycling these keep a
-    // recognisable visual identity while audio changes luminance and contrast.
-    static const uint32_t colors[][3] = {
-        {0x05000c, 0x7115a8, 0xffc8ff}, // ultraviolet bloom
-        {0x090000, 0xc3260b, 0xffd05a}, // lava
-        {0x000817, 0x075ca8, 0x72f1ff}, // deep ocean
-        {0x090700, 0x8f6500, 0xfff1a6}, // antique gold
-        {0x001316, 0x148d89, 0xe5fff4}, // teal silk
-        {0x110015, 0xb00074, 0xff93d7}, // hot magenta
-        {0x03030a, 0x3a36b8, 0x63ff9b}, // arcade violet/green
-        {0x001006, 0x168843, 0xffd75a}, // emerald gold
-        {0x000000, 0x570000, 0xff3030}, // black crimson
-        {0x100100, 0xe13b00, 0xffe063}, // flame
-        {0x000513, 0x083d91, 0xb8e8ff}, // midnight ice
-        {0x030506, 0x69767d, 0xffffff}, // chrome
-        {0x09040d, 0x44265c, 0xd7a6e8}, // velvet
-        {0x071000, 0x76a600, 0xeaff8b}, // radioactive
-        {0x100b00, 0x9b4d12, 0xf4d6a0}, // copper marble
-        {0x000d10, 0x007e92, 0x4dffe1}, // cyan circuit
-        {0x0d0010, 0x5c168f, 0xff6e47}, // synth sunset
-        {0x020c05, 0x2b7244, 0xa6ffcf}, // forest mist
-    };
-    size_t count = sizeof(colors) / sizeof(colors[0]);
-    const uint32_t *stops = colors[palette % count];
-    float p = clamp01(position);
-    int segment = p >= .5f;
-    float mix = segment ? (p - .5f) * 2.0f : p * 2.0f;
-    uint32_t a = stops[segment], b = stops[segment + 1];
-    int ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
-    int red = ar + (int)((((b >> 16) & 255) - ar) * mix);
-    int green = ag + (int)((((b >> 8) & 255) - ag) * mix);
-    int blue = ab + (int)(((b & 255) - ab) * mix);
-    float flash = accent * .18f;
-    red += (int)((255 - red) * flash);
-    green += (int)((255 - green) * flash);
-    blue += (int)((255 - blue) * flash);
-    return pax_col_rgb(red, green, blue);
+static pax_col_t procedural_palette(float position, float accent) {
+    return global_palette_color(position, accent);
 }
 
 static void seed_reaction(size_t cx, size_t cy, size_t radius) {
@@ -989,7 +1004,7 @@ static void render_reaction(pax_buf_t *buffer, const audio_analysis_snapshot_t *
         for (size_t gx = 0; gx < grid_width; gx++) {
             float value = clamp01((reaction_a[gy * grid_width + gx] - reaction_b[gy * grid_width + gx]) * .9f + .15f);
             fill_effect_cell(buffer, gx * EFFECT_PIXEL, gy * EFFECT_PIXEL,
-                             procedural_palette(0, value, audio->beat_strength));
+                             procedural_palette(value, audio->beat_strength));
         }
     }
 }
@@ -998,17 +1013,66 @@ static inline float pseudo_cell(float x, float y) {
     return fast_sin(x * 12.9898f + y * 78.233f) * .5f + .5f;
 }
 
+static void render_mind_ca(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, float dt,
+                           effect_id_t effect) {
+    if (!mind_cells || !mind_next) return;
+    size_t cells = grid_width * grid_height;
+    if (previous_effect != effect) {
+        memset(mind_cells, 0, cells);
+        memset(mind_next, 0, cells);
+        mind_cells[grid_width / 2] = 0x81;
+        mind_cells[grid_width / 3] = 0x18;
+        mind_step_time = 0;
+        mind_last_beat = audio->beat_counter;
+    }
+    if (audio->beat_counter != mind_last_beat) {
+        mind_lfsr = mind_lfsr * 1664525u + 1013904223u;
+        size_t position = (mind_lfsr >> 16) % grid_width;
+        mind_cells[position] ^= (uint8_t)(1u << (audio->beat_counter & 7));
+        mind_last_beat = audio->beat_counter;
+    }
+
+    mind_step_time += dt;
+    float step_interval = .085f - audio->bass * .030f;
+    int steps = 0;
+    while (mind_step_time >= step_interval && steps++ < 3) {
+        mind_step_time -= step_interval;
+        memcpy(mind_next, mind_cells, grid_width);
+        for (size_t y = 1; y < grid_height; y++) {
+            size_t source = (y - 1) * grid_width;
+            size_t destination = y * grid_width;
+            for (size_t x = 0; x < grid_width; x++) {
+                uint8_t left = mind_cells[source + (x + grid_width - 1) % grid_width];
+                uint8_t center = mind_cells[source + x];
+                uint8_t right = mind_cells[source + (x + 1) % grid_width];
+                uint8_t grown = left ^ right;
+                if (audio->mid > .42f) grown ^= (uint8_t)((center << 1) | (center >> 7));
+                if (audio->treble > .68f && ((x + y + audio->beat_counter) & 31u) == 0) {
+                    grown ^= (uint8_t)(mind_lfsr >> ((x + y) & 15));
+                }
+                mind_next[destination + x] = grown;
+            }
+        }
+        uint8_t *swap = mind_cells; mind_cells = mind_next; mind_next = swap;
+    }
+
+    for (size_t gy = 0; gy < grid_height; gy++) {
+        for (size_t gx = 0; gx < grid_width; gx++) {
+            uint8_t cell = mind_cells[gy * grid_width + gx];
+            float density = __builtin_popcount((unsigned)cell) / 8.0f;
+            float value = cell ? .24f + density * .70f + audio->beat_strength * .12f : .015f;
+            float structure = ((cell >> ((gx + gy) & 7)) & 1) ? .14f : 0.0f;
+            fill_effect_cell(buffer, gx * EFFECT_PIXEL, gy * EFFECT_PIXEL,
+                             global_palette_color(clamp01(value + structure), audio->beat_strength));
+        }
+    }
+}
+
 static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, float dt,
                               effect_id_t effect) {
-    static const uint8_t palettes[48] = {
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-        12, 13, 14, 15, 13, 16, 5, 2, 16, 11, 17, 3,
-        0, 15, 12, 10,
-        14, 8, 2, 3, 11, 5, 17, 15, 1, 7, 10, 16,
-        4, 8, 7, 14, 10, 13, 6, 0
-    };
     int kind = effect - EFFECT_PROCEDURAL_FIRST;
     if (kind == 0) { render_reaction(buffer, audio, dt, effect); return; }
+    if (kind == 48) { render_mind_ca(buffer, audio, dt, effect); return; }
     phase += dt * (.65f + audio->mid * 1.8f);
     if (audio->beat_counter != last_beat) { hue += 17; last_beat = audio->beat_counter; }
     float cx = screen_width * .5f, cy = screen_height * .5f;
@@ -1454,7 +1518,7 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
                     tint = iter * 11.0f + band * 4.0f;
                     break;
                 }
-                default: { // Infinite recursive flora
+                case 47: { // Infinite recursive flora
                     float flower = 0.0f;
                     float pr = radius / 240.0f;
                     for (int level = 1; level <= 4; level++) {
@@ -1464,26 +1528,85 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
                     tint = flower * 38.0f;
                     break;
                 }
+                case 49: { // Amiga-style copper bars
+                    float bar1 = fabsf(y - (cy + fast_sin(phase * .8f) * 145.0f));
+                    float bar2 = fabsf(y - (cy + fast_sin(phase * 1.1f + 2.1f) * 125.0f));
+                    float bar3 = fabsf(y - (cy + fast_sin(phase * .6f + 4.0f) * 170.0f));
+                    float glow = fmaxf(0.0f, 1.0f - fminf(bar1, fminf(bar2, bar3)) /
+                                       (24.0f + audio->bass * 28.0f));
+                    value = .018f + glow * (.72f + audio->rms * .25f);
+                    tint = (bar1 < bar2 ? bar1 : bar2) * .8f;
+                    break;
+                }
+                case 50: { // Kefrens sine bars
+                    float nearest = 999.0f;
+                    for (int bar = 0; bar < 7; bar++) {
+                        float bar_x = cx + fast_sin(y * (.018f + bar * .0015f) + phase *
+                                                   (.65f + bar * .07f) + bar * .82f) *
+                                                   (230.0f + audio->bass * 75.0f);
+                        nearest = fminf(nearest, fabsf(x - bar_x));
+                    }
+                    value = nearest < 18.0f ? clamp01(.94f - nearest / 22.0f + audio->beat_strength * .18f) : .012f;
+                    tint = nearest * 3.0f;
+                    break;
+                }
+                case 51: { // Rotozoom checker tiles
+                    float rotation = phase * .38f;
+                    float cs = fast_sin(rotation + TWO_PI * .25f);
+                    float sn = fast_sin(rotation);
+                    float zoom = .035f + audio->bass * .018f;
+                    float u = ((x - cx) * cs - (y - cy) * sn) * zoom;
+                    float v = ((x - cx) * sn + (y - cy) * cs) * zoom;
+                    int checker = ((int)floorf(u) ^ (int)floorf(v)) & 1;
+                    float edge_u = fabsf(fmodf(fabsf(u), 1.0f) - .5f);
+                    float edge_v = fabsf(fmodf(fabsf(v), 1.0f) - .5f);
+                    value = checker ? .78f + audio->treble * .18f : .08f;
+                    if (edge_u > .44f || edge_v > .44f) value = .98f;
+                    tint = (u + v) * 5.0f;
+                    break;
+                }
+                case 52: { // Shadebob accumulation field
+                    float shade = 0.0f;
+                    for (int bob = 0; bob < 9; bob++) {
+                        float bx = cx + fast_sin(phase * (.38f + bob * .025f) + bob * .71f) * 310.0f;
+                        float by = cy + fast_sin(phase * (.51f + bob * .021f) + bob * 1.19f) * 185.0f;
+                        float dx = x - bx, dy = y - by;
+                        shade += (1500.0f + audio->mid * 1200.0f) / (dx * dx + dy * dy + 650.0f);
+                    }
+                    value = clamp01(.02f + shade * .38f + audio->beat_strength * .10f);
+                    tint = shade * 21.0f;
+                    break;
+                }
+                default: { // Classic scene twister
+                    float center = cx + fast_sin(y * .021f + phase * 1.2f) *
+                                           (95.0f + audio->bass * 90.0f);
+                    float width = 42.0f + (fast_sin(y * .032f - phase * 1.8f) * .5f + .5f) * 115.0f;
+                    float local = (x - center) / width;
+                    if (fabsf(local) > 1.0f) value = .012f;
+                    else {
+                        float face = fast_sin(local * 3.1415927f + phase * 1.5f);
+                        value = clamp01(.34f + face * .42f + audio->treble * .22f);
+                    }
+                    tint = local * 30.0f;
+                    break;
+                }
             }
             float texture = fast_sin(tint * .0246f) * .5f + .5f;
             float texture_mix = (kind >= 28 && kind < 40) ? 0.0f : .18f;
             float palette_position = clamp01(value * (1.0f - texture_mix) + texture * texture_mix);
             fill_effect_cell(buffer, x, y,
-                             procedural_palette(palettes[kind], palette_position, audio->beat_strength));
+                             procedural_palette(palette_position, audio->beat_strength));
         }
     }
 }
 
 static void render_algorithmic_morph(pax_buf_t *buffer) {
     if (!morph_start || !morph_pixels || !buffer->buf_16bpp) return;
-    float progress = (esp_timer_get_time() - morph_start) / 650000.0f;
+    float progress = (esp_timer_get_time() - morph_start) / 3200000.0f;
     if (progress >= 1.0f) { morph_start = 0; return; }
     if (progress < 0.0f) progress = 0.0f;
-    // Smooth timing, but never colour-alpha blend: cells are either the new
-    // algorithm or a geometrically transformed sample from the old frame.
     progress = progress * progress * (3.0f - 2.0f * progress);
     float cx = screen_width * .5f, cy = screen_height * .5f;
-    float max_radius = sqrtf(cx * cx + cy * cy);
     float warp = fast_sin(progress * 3.1415927f);
     size_t raw_width = buffer->width;
     for (size_t y = 0; y < screen_height; y += EFFECT_PIXEL) {
@@ -1493,51 +1616,34 @@ static void render_algorithmic_morph(pax_buf_t *buffer) {
             size_t index = (y / EFFECT_PIXEL) * grid_width + x / EFFECT_PIXEL;
             float radius = radial_lut ? radial_lut[index] : 0.0f;
             float angle = angle_lut ? angle_lut[index] : 0.0f;
-            float threshold;
-            switch (morph_mode) {
-                case 0: // vortex opens from the centre
-                    threshold = radius / max_radius + fast_sin(angle * 7.0f) * .08f;
-                    break;
-                case 1: // organic cellular replacement
-                    threshold = pseudo_cell((float)(x >> 4), (float)(y >> 4)) * .82f +
-                                fast_sin((x + y) * .018f) * .09f;
-                    break;
-                case 2: // rotating angular fan / kaleidoscope
-                    threshold = (angle + 3.1415927f) / TWO_PI +
-                                fast_sin(radius * .045f) * .10f;
-                    break;
-                default: // liquid curtain
-                    threshold = (float)y / screen_height +
-                                fast_sin(x * .025f + progress * 8.0f) * .13f;
-                    break;
-            }
-            threshold = clamp01(threshold);
-            if (progress >= threshold) continue;
-
             float dx = x - cx, dy = y - cy;
-            float sx_float = x, sy_float = y;
-            if (morph_mode == 0) {
-                float twist = warp * .85f * (1.0f - radius / max_radius);
-                float sa = fast_sin(angle + twist), ca = fast_sin(angle + twist + TWO_PI * .25f);
-                sx_float = cx + ca * radius * (1.0f - warp * .08f);
-                sy_float = cy + sa * radius * (1.0f - warp * .08f);
-            } else if (morph_mode == 1) {
-                sx_float += fast_sin(y * .035f + progress * 9.0f) * warp * 28.0f;
-                sy_float += fast_sin(x * .029f - progress * 7.0f) * warp * 22.0f;
-            } else if (morph_mode == 2) {
-                float folded = fabsf(fmodf(angle * 5.0f + progress * TWO_PI, TWO_PI) - 3.1415927f) / 5.0f;
-                sx_float = cx + fast_sin(folded + TWO_PI * .25f) * radius;
-                sy_float = cy + fast_sin(folded) * radius;
-            } else {
-                float scale = 1.0f + warp * .18f;
-                sx_float = cx + dx * scale + fast_sin(y * .02f) * warp * 14.0f;
-                sy_float = cy + dy * scale;
-            }
+            float flow_phase = morph_sequence * 1.37f;
+            float flow_x = fast_sin(y * .026f + flow_phase + progress * 2.3f) +
+                           fast_sin(radius * .018f - flow_phase) * .55f;
+            float flow_y = fast_sin(x * .021f - flow_phase - progress * 1.9f) +
+                           fast_sin(angle * 3.0f + progress * 2.0f) * .45f;
+            float twist = warp * (.16f + fast_sin(radius * .012f + flow_phase) * .08f);
+            float sa = fast_sin(twist), ca = fast_sin(twist + TWO_PI * .25f);
+            float sx_float = cx + (dx * ca - dy * sa) * (1.0f + warp * .045f) + flow_x * warp * 24.0f;
+            float sy_float = cy + (dx * sa + dy * ca) * (1.0f + warp * .045f) + flow_y * warp * 20.0f;
             int sx = (int)sx_float, sy = (int)sy_float;
             if (sx < 0) sx = 0; else if (sx >= (int)screen_width) sx = screen_width - 1;
             if (sy < 0) sy = 0; else if (sy >= (int)screen_height) sy = screen_height - 1;
-            uint16_t raw = morph_pixels[(size_t)sx * raw_width + (raw_width - 1 - (size_t)sy)];
-            fill_effect_cell(buffer, x, y, buffer->buf2col(buffer, raw));
+
+            uint16_t old_raw = morph_pixels[(size_t)sx * raw_width + (raw_width - 1 - (size_t)sy)];
+            size_t current_offset = x * raw_width + (raw_width - 1 - y);
+            uint16_t new_raw = buffer->buf_16bpp[current_offset];
+            pax_col_t old_color = buffer->buf2col(buffer, old_raw);
+            pax_col_t new_color = buffer->buf2col(buffer, new_raw);
+            float turbulence = (flow_x + flow_y) * .075f * warp;
+            float mix = clamp01(progress + turbulence);
+            mix = mix * mix * (3.0f - 2.0f * mix);
+            int red = (int)(((old_color >> 16) & 255) * (1.0f - mix) +
+                            ((new_color >> 16) & 255) * mix);
+            int green = (int)(((old_color >> 8) & 255) * (1.0f - mix) +
+                              ((new_color >> 8) & 255) * mix);
+            int blue = (int)((old_color & 255) * (1.0f - mix) + (new_color & 255) * mix);
+            fill_effect_cell(buffer, x, y, pax_col_rgb(red, green, blue));
         }
     }
 }
@@ -1554,6 +1660,7 @@ void effects_render(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, f
     adjusted.beat_strength = clamp01(adjusted.beat_strength * intensity);
     for (size_t i = 0; i < AUDIO_ANALYSIS_BANDS; i++) adjusted.bands[i] = clamp01(adjusted.bands[i] * intensity);
     audio = &adjusted;
+    update_global_palette(audio, dt);
     switch (current_effect) {
         case EFFECT_PLASMA: render_plasma(buffer, audio, dt); break;
         case EFFECT_METABALLS: render_metaballs(buffer, audio, dt); break;

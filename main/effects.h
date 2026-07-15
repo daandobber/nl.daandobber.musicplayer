@@ -18,7 +18,7 @@ typedef enum {
     EFFECT_RIBBONS,
     EFFECT_MILKDROP_FIRST,
     EFFECT_PROCEDURAL_FIRST = EFFECT_MILKDROP_FIRST + 64,
-    EFFECT_COUNT = EFFECT_PROCEDURAL_FIRST + 48,
+    EFFECT_COUNT = EFFECT_PROCEDURAL_FIRST + 54,
 } effect_id_t;
 
 void        effects_init(size_t width, size_t height);

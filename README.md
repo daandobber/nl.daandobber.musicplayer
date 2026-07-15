@@ -5,8 +5,9 @@ Audio-reactive MP3/WAV player for the Nicolai Electronics Tanmatsu (ESP32-P4).
 Application ID: `nl.daandobber.musicplayer`
 
 The built-in **MilkDrip** visualizer is a compact, low-resolution homage to
-MilkDrop. It combines PCM-driven feedback, procedural rendering, restricted
-colour palettes and algorithmic morph transitions designed for the ESP32-P4.
+MilkDrop. It combines PCM-driven feedback, procedural rendering, continuously
+evolving global colour palettes and fluid field-morph transitions designed for
+the ESP32-P4.
 
 ## Features
 
@@ -16,8 +17,9 @@ colour palettes and algorithmic morph transitions designed for the ESP32-P4.
 - Editable play queue: replace it with an artist or album, append selections, and remove tracks.
 - Hardware volume control and speaker/headphone handling through the Tanmatsu BSP.
 - 12-band FFT, RMS, peak and beat analysis of the PCM that is sent to I2S.
-- 122 audio-reactive effects: 64 MilkDrop-style feedback presets plus 48 independent procedural/minimal/hybrid renderers, 24 feedback warps and 18 deliberately restricted colour palettes.
-- Fast algorithmic morphs between effects (vortex, cellular, kaleidoscopic and liquid transforms) without colour crossfades.
+- 128 audio-reactive effects: 64 MilkDrop-style feedback presets plus 54 independent procedural, minimal, hybrid and demoscene-inspired renderers.
+- Eighteen global colour palettes continuously blend independently of the active algorithm.
+- Slow fluid transitions advect the previous image through a vector field while the next algorithm emerges.
 - Instant preset switching without an expensive full-frame crossfade.
 - Persistent settings for timed/beat-based automatic effect switching, shuffle, visual intensity, brightness and idle dimming.
 - Real JPEG album art from MP3 ID3 `APIC` or nearby `cover.jpg`, `folder.jpg`, or `front.jpg`; generated art is the fallback.
@@ -53,3 +55,9 @@ kept outside this repository.
 The plasma and metaballs algorithms are adapted from the MIT-0 licensed
 `esp_effects` project by Mika Tuupola. The rendering and all audio-reactive
 control code in this application are Tanmatsu/PAX-specific implementations.
+
+`Mind Is Growing` is an original cellular-automaton effect inspired by the
+techniques Linus Akesson documented for his 256-byte C64 demo
+[A Mind Is Born](https://linusakesson.net/scene/a-mind-is-born/). No original
+demo code is included. Copper bars, Kefrens bars, rotozoom, shadebobs and the
+twister are original implementations of classic demoscene effect families.
