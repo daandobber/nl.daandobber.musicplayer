@@ -1068,6 +1068,25 @@ static void render_mind_ca(pax_buf_t *buffer, const audio_analysis_snapshot_t *a
     }
 }
 
+static inline void fill_effect_cell_raw(pax_buf_t *buffer, size_t x, size_t y, uint16_t pixel) {
+    size_t width = EFFECT_PIXEL;
+    size_t height = EFFECT_PIXEL;
+    if (x + width > screen_width) width = screen_width - x;
+    if (y + height > screen_height) height = screen_height - y;
+    if (overlay_visible && x < CARD_X + CARD_W && x + width > CARD_X &&
+        y < CARD_Y + CARD_H && y + height > CARD_Y) return;
+    if (buffer->orientation != PAX_O_ROT_CW || !buffer->buf_16bpp) {
+        fill_effect_cell(buffer, x, y, buffer->buf2col(buffer, pixel));
+        return;
+    }
+    size_t raw_width = (size_t)buffer->width;
+    size_t first_column = raw_width - y - height;
+    for (size_t logical_x = x; logical_x < x + width; logical_x++) {
+        uint16_t *destination = buffer->buf_16bpp + logical_x * raw_width + first_column;
+        for (size_t column = 0; column < height; column++) destination[column] = pixel;
+    }
+}
+
 static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, float dt,
                               effect_id_t effect) {
     int kind = effect - EFFECT_PROCEDURAL_FIRST;
@@ -1602,48 +1621,49 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
 
 static void render_algorithmic_morph(pax_buf_t *buffer) {
     if (!morph_start || !morph_pixels || !buffer->buf_16bpp) return;
-    float progress = (esp_timer_get_time() - morph_start) / 3200000.0f;
+    float progress = (esp_timer_get_time() - morph_start) / 2400000.0f;
     if (progress >= 1.0f) { morph_start = 0; return; }
     if (progress < 0.0f) progress = 0.0f;
     progress = progress * progress * (3.0f - 2.0f * progress);
     float cx = screen_width * .5f, cy = screen_height * .5f;
     float warp = fast_sin(progress * 3.1415927f);
+    float flow_phase = morph_sequence * 1.37f + progress * 2.2f;
     size_t raw_width = buffer->width;
+    float column_flow[grid_width];
+    for (size_t gx = 0; gx < grid_width; gx++) {
+        float x = gx * EFFECT_PIXEL;
+        column_flow[gx] = fast_sin(x * .021f - flow_phase) +
+                          fast_sin(x * .008f + flow_phase * .61f) * .35f;
+    }
     for (size_t y = 0; y < screen_height; y += EFFECT_PIXEL) {
+        float row_flow = fast_sin(y * .026f + flow_phase) +
+                         fast_sin(y * .009f - flow_phase * .73f) * .45f;
         for (size_t x = 0; x < screen_width; x += EFFECT_PIXEL) {
             if (overlay_visible && x < CARD_X + CARD_W && x + EFFECT_PIXEL > CARD_X &&
                 y < CARD_Y + CARD_H && y + EFFECT_PIXEL > CARD_Y) continue;
             size_t index = (y / EFFECT_PIXEL) * grid_width + x / EFFECT_PIXEL;
             float radius = radial_lut ? radial_lut[index] : 0.0f;
-            float angle = angle_lut ? angle_lut[index] : 0.0f;
+            uint32_t hash = (uint32_t)(x / EFFECT_PIXEL) * 73856093u ^
+                            (uint32_t)(y / EFFECT_PIXEL) * 19349663u ^
+                            (uint32_t)morph_sequence * 83492791u;
+            hash ^= hash >> 13;
+            hash *= 1274126177u;
+            hash ^= hash >> 16;
+            float noise = (hash & 255u) / 255.0f;
+            float liquid = fast_sin(x * .018f + y * .014f + flow_phase) * .5f + .5f;
+            float threshold = clamp01(noise * .58f + liquid * .42f);
+            if (progress >= threshold) continue;
+
             float dx = x - cx, dy = y - cy;
-            float flow_phase = morph_sequence * 1.37f;
-            float flow_x = fast_sin(y * .026f + flow_phase + progress * 2.3f) +
-                           fast_sin(radius * .018f - flow_phase) * .55f;
-            float flow_y = fast_sin(x * .021f - flow_phase - progress * 1.9f) +
-                           fast_sin(angle * 3.0f + progress * 2.0f) * .45f;
-            float twist = warp * (.16f + fast_sin(radius * .012f + flow_phase) * .08f);
-            float sa = fast_sin(twist), ca = fast_sin(twist + TWO_PI * .25f);
-            float sx_float = cx + (dx * ca - dy * sa) * (1.0f + warp * .045f) + flow_x * warp * 24.0f;
-            float sy_float = cy + (dx * sa + dy * ca) * (1.0f + warp * .045f) + flow_y * warp * 20.0f;
+            float swirl = warp * 20.0f / (radius + 18.0f);
+            float sx_float = x + row_flow * warp * 24.0f - dy * swirl;
+            float sy_float = y + column_flow[x / EFFECT_PIXEL] * warp * 18.0f + dx * swirl;
             int sx = (int)sx_float, sy = (int)sy_float;
             if (sx < 0) sx = 0; else if (sx >= (int)screen_width) sx = screen_width - 1;
             if (sy < 0) sy = 0; else if (sy >= (int)screen_height) sy = screen_height - 1;
 
             uint16_t old_raw = morph_pixels[(size_t)sx * raw_width + (raw_width - 1 - (size_t)sy)];
-            size_t current_offset = x * raw_width + (raw_width - 1 - y);
-            uint16_t new_raw = buffer->buf_16bpp[current_offset];
-            pax_col_t old_color = buffer->buf2col(buffer, old_raw);
-            pax_col_t new_color = buffer->buf2col(buffer, new_raw);
-            float turbulence = (flow_x + flow_y) * .075f * warp;
-            float mix = clamp01(progress + turbulence);
-            mix = mix * mix * (3.0f - 2.0f * mix);
-            int red = (int)(((old_color >> 16) & 255) * (1.0f - mix) +
-                            ((new_color >> 16) & 255) * mix);
-            int green = (int)(((old_color >> 8) & 255) * (1.0f - mix) +
-                              ((new_color >> 8) & 255) * mix);
-            int blue = (int)((old_color & 255) * (1.0f - mix) + (new_color & 255) * mix);
-            fill_effect_cell(buffer, x, y, pax_col_rgb(red, green, blue));
+            fill_effect_cell_raw(buffer, x, y, old_raw);
         }
     }
 }
