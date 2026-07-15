@@ -312,12 +312,6 @@ static pax_col_t color_scale(pax_col_t color, float scale) {
                        (int)((color & 255) * scale));
 }
 
-static pax_col_t color_alpha(pax_col_t color, float alpha) {
-    if (alpha < 0.0f) alpha = 0.0f;
-    if (alpha > 1.0f) alpha = 1.0f;
-    return ((uint32_t)(alpha * 255.0f) << 24) | (color & 0x00ffffff);
-}
-
 static void draw_now_card(pax_buf_t *buffer, const audio_player_snapshot_t *player) {
     size_t library_track = media_library_find_path(&library, player->path);
     const media_track_t *metadata = library_track != SIZE_MAX ? &library.tracks[library_track] : NULL;
@@ -376,52 +370,40 @@ static void draw_now_card(pax_buf_t *buffer, const audio_player_snapshot_t *play
 static void draw_now_announce(pax_buf_t *buffer, const audio_player_snapshot_t *player,
                               const audio_analysis_snapshot_t *analysis) {
     float elapsed = (esp_timer_get_time() - now_announce_start) / 1000000.0f;
-    if (elapsed < 0.0f || elapsed > 5.2f) return;
-    float visibility = elapsed < .45f ? elapsed / .45f :
-                       (elapsed > 3.8f ? (5.2f - elapsed) / 1.4f : 1.0f);
-    visibility *= visibility * (3.0f - 2.0f * visibility);
+    if (elapsed < .12f || elapsed > 4.6f) return;
 
     size_t library_track = media_library_find_path(&library, player->path);
     const media_track_t *metadata = library_track != SIZE_MAX ? &library.tracks[library_track] : NULL;
     const char *title_source = metadata ? metadata->title : media_library_display_name(player->path);
     const char *artist_source = metadata ? metadata->artist : "Unknown artist";
-    const char *album_source = metadata ? metadata->album : "";
-    char title[64], artist[64], album[64];
-    clipped_text(title, sizeof(title), title_source, 34);
-    clipped_text(artist, sizeof(artist), artist_source, 38);
-    clipped_text(album, sizeof(album), album_source, 42);
+    char title[64], artist[64];
+    clipped_text(title, sizeof(title), title_source, 32);
+    clipped_text(artist, sizeof(artist), artist_source, 36);
 
     pax_col_t accent = effects_palette_color(.82f, analysis->beat_strength);
     pax_col_t secondary = effects_palette_color(.38f, analysis->beat_strength * .5f);
-    float pulse = .72f + analysis->bass * .28f;
+    float pulse = .76f + analysis->bass * .24f;
     int center = pax_buf_get_width(buffer) / 2;
     int baseline = 338 + (int)(analysis->bass * 7.0f);
-    for (int band = 0; band < AUDIO_ANALYSIS_BANDS; band++) {
-        float strength = analysis->bands[band];
+    for (int band = 0; band < 6; band++) {
+        float strength = analysis->bands[band * 2];
         int length = 18 + (int)(strength * 88.0f);
-        int y = baseline - 38 + band * 6;
-        pax_simple_rect(buffer, color_alpha(band & 1 ? accent : secondary, visibility * .18f),
+        int y = baseline - 31 + band * 10;
+        pax_simple_rect(buffer, color_scale(band & 1 ? accent : secondary, .34f),
                         center - 260 - length, y, length, 2);
-        pax_simple_rect(buffer, color_alpha(band & 1 ? secondary : accent, visibility * .18f),
+        pax_simple_rect(buffer, color_scale(band & 1 ? secondary : accent, .34f),
                         center + 260, y, length, 2);
     }
 
-    pax_vec2f title_size = pax_text_size(pax_font_sky_mono, 29, title);
-    pax_vec2f artist_size = pax_text_size(pax_font_sky_mono, 17, artist);
-    pax_vec2f album_size = pax_text_size(pax_font_sky_mono, 9, album);
+    pax_vec2f title_size = pax_text_size(pax_font_sky_mono, 25, title);
+    pax_vec2f artist_size = pax_text_size(pax_font_sky_mono, 15, artist);
     float title_x = center - title_size.x * .5f;
-    pax_draw_text(buffer, color_alpha(0xff000000, visibility * .72f), pax_font_sky_mono, 29,
-                  title_x + 3, baseline + 3, title);
-    pax_draw_text(buffer, color_alpha(COLOR_TEXT, visibility * pulse), pax_font_sky_mono, 29,
+    pax_draw_text(buffer, color_scale(COLOR_TEXT, pulse), pax_font_sky_mono, 25,
                   title_x, baseline, title);
-    pax_draw_text(buffer, color_alpha(accent, visibility), pax_font_sky_mono, 17,
+    pax_draw_text(buffer, accent, pax_font_sky_mono, 15,
                   center - artist_size.x * .5f, baseline + 39, artist);
-    if (album[0]) {
-        pax_draw_text(buffer, color_alpha(secondary, visibility * .78f), pax_font_sky_mono, 9,
-                      center - album_size.x * .5f, baseline + 65, album);
-    }
     int line = 54 + (int)(analysis->rms * 170.0f);
-    pax_simple_rect(buffer, color_alpha(accent, visibility * .8f), center - line, baseline - 12,
+    pax_simple_rect(buffer, color_scale(accent, .82f), center - line, baseline - 12,
                     line * 2, 2);
 }
 
