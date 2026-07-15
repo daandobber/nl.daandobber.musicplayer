@@ -58,6 +58,9 @@ static int64_t       morph_start;
 static uint8_t       morph_sequence;
 static float         palette_cursor;
 static uint32_t      palette_last_beat;
+static uint8_t       palette_mode = 1;
+static uint8_t       palette_base;
+static uint8_t       palette_speed = 2;
 
 typedef struct { float x, y, z; } effect_star_t;
 static effect_star_t stars[STAR_COUNT];
@@ -119,9 +122,16 @@ pax_col_t effects_palette_color(float position, float accent) {
 }
 
 static void update_global_palette(const audio_analysis_snapshot_t *audio, float dt) {
-    palette_cursor += dt * (.040f + audio->treble * .028f);
+    static const float speed_scale[] = {0.0f, .35f, 1.0f, 2.4f, 5.0f};
+    float speed = speed_scale[palette_speed < 5 ? palette_speed : 2];
+    if (palette_mode == 0) {
+        palette_cursor = palette_base;
+    } else if (palette_mode == 1) {
+        palette_cursor += dt * (.040f + audio->treble * .028f) * speed;
+    }
     if (audio->beat_counter != palette_last_beat) {
-        palette_cursor += audio->beat_strength * .018f;
+        if (palette_mode == 1) palette_cursor += audio->beat_strength * .018f * speed;
+        else if (palette_mode == 2) palette_cursor += (.20f + audio->beat_strength * .42f) * speed;
         palette_last_beat = audio->beat_counter;
     }
 }
@@ -266,7 +276,7 @@ effect_id_t effects_current(void) {
     return current_effect;
 }
 
-const char *effects_name(void) {
+const char *effects_name_for(effect_id_t effect) {
     static const char *legacy_names[] = {
         "Plasma", "Metaballs", "Spectrum", "Neon scope", "Warp tunnel", "Radial pulse", "Star rush", "Kaleido",
         "Liquid feedback", "Wave ribbons"
@@ -305,9 +315,14 @@ const char *effects_name(void) {
         "Mind Is Growing", "Copper tide", "Kefrens echoes", "Rotozoom tiles",
         "Shadebob trails", "Scene twister"
     };
-    if (current_effect < EFFECT_MILKDROP_FIRST) return legacy_names[current_effect];
-    if (current_effect < EFFECT_PROCEDURAL_FIRST) return milk_names[current_effect - EFFECT_MILKDROP_FIRST];
-    return procedural_names[current_effect - EFFECT_PROCEDURAL_FIRST];
+    if (effect >= EFFECT_COUNT) return "Unknown";
+    if (effect < EFFECT_MILKDROP_FIRST) return legacy_names[effect];
+    if (effect < EFFECT_PROCEDURAL_FIRST) return milk_names[effect - EFFECT_MILKDROP_FIRST];
+    return procedural_names[effect - EFFECT_PROCEDURAL_FIRST];
+}
+
+const char *effects_name(void) {
+    return effects_name_for(current_effect);
 }
 
 void effects_set_overlay_visible(bool visible) {
@@ -316,6 +331,16 @@ void effects_set_overlay_visible(bool visible) {
 
 void effects_set_intensity(uint8_t intensity) {
     visual_intensity = intensity > 2 ? 2 : intensity;
+}
+
+void effects_set_palette_controls(uint8_t mode, uint8_t palette, uint8_t speed) {
+    if (mode > 2) mode = 1;
+    if (palette >= 18) palette = 0;
+    if (speed > 4) speed = 2;
+    if (palette != palette_base || mode != palette_mode) palette_cursor = palette;
+    palette_mode = mode;
+    palette_base = palette;
+    palette_speed = speed;
 }
 
 static void render_plasma(pax_buf_t *buffer, const audio_analysis_snapshot_t *audio, float dt) {
@@ -1329,8 +1354,8 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
                     break;
                 }
                 case 24: { // Infinite folding fractal zoom
-                    float fx = nx * infinite_scale;
-                    float fy = ny * infinite_scale;
+                    float fx = nx / infinite_scale;
+                    float fy = ny / infinite_scale;
                     for (int fold = 0; fold < 5; fold++) {
                         fx = fabsf(fx) * 1.72f - .83f + fast_sin(phase * .13f) * .04f;
                         fy = fabsf(fy) * 1.72f - .68f;
@@ -1344,11 +1369,14 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
                     break;
                 }
                 case 25: { // Vector vortex flow magnitude
-                    float spin = angle + phase * .35f + fast_sin(radius * .018f - phase) *
+                    float zoom_radius = radius / infinite_scale;
+                    float zoom_nx = nx / infinite_scale;
+                    float zoom_ny = ny / infinite_scale;
+                    float spin = angle + phase * .35f + fast_sin(zoom_radius * .018f - phase) *
                                  (.45f + audio->bass * .65f);
-                    float vx = fast_sin(spin + TWO_PI * .25f) * fast_sin(ny * 9.0f + phase);
-                    float vy = fast_sin(spin) * fast_sin(nx * 11.0f - phase * .8f);
-                    float curl = fast_sin((vx - vy) * 8.0f + radius * .035f);
+                    float vx = fast_sin(spin + TWO_PI * .25f) * fast_sin(zoom_ny * 9.0f + phase);
+                    float vy = fast_sin(spin) * fast_sin(zoom_nx * 11.0f - phase * .8f);
+                    float curl = fast_sin((vx - vy) * 8.0f + zoom_radius * .035f);
                     value = clamp01(.46f + curl * (.32f + audio->mid * .22f));
                     tint = spin * 28.0f;
                     break;
@@ -1362,7 +1390,7 @@ static void render_procedural(pax_buf_t *buffer, const audio_analysis_snapshot_t
                     break;
                 }
                 case 27: { // Infinite nested portals
-                    float px = nx, py = ny;
+                    float px = nx / infinite_scale, py = ny / infinite_scale;
                     float portal = 0.0f;
                     for (int level = 0; level < 4; level++) {
                         float local_radius = sqrtf(px * px + py * py);

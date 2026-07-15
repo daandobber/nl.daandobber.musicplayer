@@ -15,16 +15,20 @@ static const app_settings_t defaults = {
     .auto_seconds = 45,
     .auto_beats = 64,
     .dim_timeout_seconds = 120,
+    .fixed_effect = 122,
+    .palette_mode = 1,
+    .palette_index = 0,
+    .palette_speed = 2,
 };
 
 void app_settings_load(app_settings_t *settings) {
     *settings = defaults;
     nvs_handle_t handle;
     if (nvs_open("musicplayer", NVS_READONLY, &handle) != ESP_OK) return;
-    app_settings_t stored = {0};
+    app_settings_t stored = defaults;
     size_t size = sizeof(stored);
-    if (nvs_get_blob(handle, "settings", &stored, &size) == ESP_OK && size == sizeof(stored) &&
-        stored.magic == SETTINGS_MAGIC) {
+    if (nvs_get_blob(handle, "settings", &stored, &size) == ESP_OK && size >= 16 &&
+        size <= sizeof(stored) && stored.magic == SETTINGS_MAGIC) {
         *settings = stored;
     }
     nvs_close(handle);

@@ -107,6 +107,8 @@ static uint16_t *announce_surface;
 static size_t announce_surface_pixels;
 static char announce_path[AUDIO_PLAYER_PATH_MAX];
 
+static void change_effect_automatically(void);
+
 static pax_orientation_t display_orientation(void) {
     switch (bsp_display_get_default_rotation()) {
         case BSP_DISPLAY_ROTATION_90: return PAX_O_ROT_CCW;
@@ -518,32 +520,44 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
     overlay_time_total += esp_timer_get_time() - overlay_start;
 }
 
-#define SETTINGS_ITEM_COUNT 9
+#define SETTINGS_ITEM_COUNT 13
 
 static const char *setting_label(size_t index) {
     static const char *labels[SETTINGS_ITEM_COUNT] = {
-        "Automatic effects", "Order", "Switch interval", "Beats per effect",
+        "Animation switching", "Fixed animation", "Order", "Switch interval",
+        "Beats per effect", "Colour behavior", "Colour palette", "Colour speed",
         "Brightness", "Dim after", "Dim level", "Visual intensity", "Test dimming"
     };
     return labels[index];
 }
 
 static void setting_value(size_t index, char *value, size_t value_size) {
-    static const char *modes[] = {"Off", "Timed", "On beats"};
+    static const char *modes[] = {"Off", "Timed", "On beats", "Per track"};
     static const char *intensities[] = {"Calm", "Normal", "Intense"};
+    static const char *colour_modes[] = {"Fixed", "Flow", "Beat step"};
+    static const char *colour_speeds[] = {"Still", "Slow", "Normal", "Fast", "Turbo"};
+    static const char *palettes[] = {
+        "Ultraviolet", "Lava", "Deep ocean", "Antique gold", "Teal silk", "Hot magenta",
+        "Arcade", "Emerald gold", "Crimson", "Flame", "Midnight ice", "Chrome",
+        "Velvet", "Radioactive", "Copper", "Cyan circuit", "Synth sunset", "Forest mist"
+    };
     switch (index) {
         case 0: strlcpy(value, modes[settings.auto_effect_mode], value_size); break;
-        case 1: strlcpy(value, settings.shuffle_effects ? "Shuffle" : "Sequential", value_size); break;
-        case 2: snprintf(value, value_size, "%u sec", settings.auto_seconds); break;
-        case 3: snprintf(value, value_size, "%u beats", settings.auto_beats); break;
-        case 4: snprintf(value, value_size, "%u%%", settings.brightness); break;
-        case 5:
+        case 1: strlcpy(value, effects_name_for((effect_id_t)settings.fixed_effect), value_size); break;
+        case 2: strlcpy(value, settings.shuffle_effects ? "Shuffle" : "Sequential", value_size); break;
+        case 3: snprintf(value, value_size, "%u sec", settings.auto_seconds); break;
+        case 4: snprintf(value, value_size, "%u beats", settings.auto_beats); break;
+        case 5: strlcpy(value, colour_modes[settings.palette_mode], value_size); break;
+        case 6: strlcpy(value, palettes[settings.palette_index], value_size); break;
+        case 7: strlcpy(value, colour_speeds[settings.palette_speed], value_size); break;
+        case 8: snprintf(value, value_size, "%u%%", settings.brightness); break;
+        case 9:
             if (settings.dim_timeout_seconds == 0) strlcpy(value, "Never", value_size);
             else snprintf(value, value_size, "%u sec", settings.dim_timeout_seconds);
             break;
-        case 6: snprintf(value, value_size, "%u%%", settings.dim_brightness); break;
-        case 7: strlcpy(value, intensities[settings.visual_intensity], value_size); break;
-        case 8: strlcpy(value, "Press Right", value_size); break;
+        case 10: snprintf(value, value_size, "%u%%", settings.dim_brightness); break;
+        case 11: strlcpy(value, intensities[settings.visual_intensity], value_size); break;
+        case 12: strlcpy(value, "Press Right", value_size); break;
         default: value[0] = '\0'; break;
     }
 }
@@ -553,8 +567,11 @@ static void render_settings(pax_buf_t *buffer) {
     int width = pax_buf_get_width(buffer);
     pax_background(buffer, COLOR_BG);
     draw_header(buffer, "MUSICPLAYER // SETTINGS", "F5");
-    for (size_t i = 0; i < SETTINGS_ITEM_COUNT; i++) {
-        int y = 70 + i * 39;
+    const size_t rows = 9;
+    size_t first = visible_start(selected_setting, SETTINGS_ITEM_COUNT, rows);
+    for (size_t row = 0; row < rows && first + row < SETTINGS_ITEM_COUNT; row++) {
+        size_t i = first + row;
+        int y = 66 + row * 39;
         if (i == selected_setting) pax_simple_rect(buffer, COLOR_SELECTED, 42, y - 6, width - 84, 36);
         pax_draw_text(buffer, i == selected_setting ? COLOR_TEXT : COLOR_DIM,
                       pax_font_sky_mono, 18, 58, y, setting_label(i));
@@ -564,7 +581,7 @@ static void render_settings(pax_buf_t *buffer) {
         pax_draw_text(buffer, i == selected_setting ? COLOR_ACCENT : COLOR_DIM,
                       pax_font_sky_mono, 18, width - 58 - size.x, y, value);
     }
-    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, 48, 440,
+    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, 48, 444,
                   "Up/Down select    Left/Right change    Esc/F5 back    settings save automatically");
 }
 
@@ -656,6 +673,7 @@ static void play_queue_position(size_t position) {
         now_card_valid[1] = false;
         overlay_signature_valid = false;
         render_dirty = true;
+        if (settings.auto_effect_mode == AUTO_EFFECT_TRACK) change_effect_automatically();
     }
 }
 
@@ -748,7 +766,14 @@ static uint16_t cycle_choice(uint16_t current, const uint16_t *choices, size_t c
 }
 
 static void apply_settings(void) {
+    if (settings.auto_effect_mode > AUTO_EFFECT_TRACK) settings.auto_effect_mode = AUTO_EFFECT_TIME;
+    if (settings.fixed_effect >= EFFECT_COUNT) settings.fixed_effect = EFFECT_PROCEDURAL_FIRST + 48;
+    if (settings.palette_mode > 2) settings.palette_mode = 1;
+    if (settings.palette_index >= 18) settings.palette_index = 0;
+    if (settings.palette_speed > 4) settings.palette_speed = 2;
     effects_set_intensity(settings.visual_intensity);
+    effects_set_palette_controls(settings.palette_mode, settings.palette_index, settings.palette_speed);
+    if (settings.auto_effect_mode == AUTO_EFFECT_OFF) effects_select((effect_id_t)settings.fixed_effect);
     if (!display_dimmed) bsp_display_set_backlight_brightness(settings.brightness);
     app_settings_save(&settings);
     last_effect_change_time = esp_timer_get_time();
@@ -762,23 +787,31 @@ static void change_setting(int delta) {
     static const uint16_t beats[] = {8, 16, 32, 64, 96, 128};
     static const uint16_t dim_times[] = {0, 30, 60, 120, 300, 600};
     switch (selected_setting) {
-        case 0: settings.auto_effect_mode = (settings.auto_effect_mode + (delta > 0 ? 1 : 2)) % 3; break;
-        case 1: settings.shuffle_effects = !settings.shuffle_effects; break;
-        case 2: settings.auto_seconds = cycle_choice(settings.auto_seconds, seconds, sizeof(seconds) / sizeof(seconds[0]), delta); break;
-        case 3: settings.auto_beats = cycle_choice(settings.auto_beats, beats, sizeof(beats) / sizeof(beats[0]), delta); break;
-        case 4: {
+        case 0: settings.auto_effect_mode = (settings.auto_effect_mode + (delta > 0 ? 1 : 3)) % 4; break;
+        case 1:
+            settings.fixed_effect = delta > 0 ? (settings.fixed_effect + 1) % EFFECT_COUNT
+                                              : (settings.fixed_effect + EFFECT_COUNT - 1) % EFFECT_COUNT;
+            break;
+        case 2: settings.shuffle_effects = !settings.shuffle_effects; break;
+        case 3: settings.auto_seconds = cycle_choice(settings.auto_seconds, seconds, sizeof(seconds) / sizeof(seconds[0]), delta); break;
+        case 4: settings.auto_beats = cycle_choice(settings.auto_beats, beats, sizeof(beats) / sizeof(beats[0]), delta); break;
+        case 5: settings.palette_mode = (settings.palette_mode + (delta > 0 ? 1 : 2)) % 3; break;
+        case 6: settings.palette_index = delta > 0 ? (settings.palette_index + 1) % 18
+                                                   : (settings.palette_index + 17) % 18; break;
+        case 7: settings.palette_speed = (settings.palette_speed + (delta > 0 ? 1 : 4)) % 5; break;
+        case 8: {
             int value = settings.brightness + delta * 10;
             settings.brightness = value < 20 ? 100 : (value > 100 ? 20 : value);
             break;
         }
-        case 5: settings.dim_timeout_seconds = cycle_choice(settings.dim_timeout_seconds, dim_times, sizeof(dim_times) / sizeof(dim_times[0]), delta); break;
-        case 6: {
+        case 9: settings.dim_timeout_seconds = cycle_choice(settings.dim_timeout_seconds, dim_times, sizeof(dim_times) / sizeof(dim_times[0]), delta); break;
+        case 10: {
             int value = settings.dim_brightness + delta * 10;
             settings.dim_brightness = value < 0 ? 60 : (value > 60 ? 0 : value);
             break;
         }
-        case 7: settings.visual_intensity = (settings.visual_intensity + (delta > 0 ? 1 : 2)) % 3; break;
-        case 8:
+        case 11: settings.visual_intensity = (settings.visual_intensity + (delta > 0 ? 1 : 2)) % 3; break;
+        case 12:
             display_dimmed = true;
             ESP_LOGI(TAG, "Dim test: %u%%", settings.dim_brightness);
             ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.dim_brightness));
@@ -883,10 +916,14 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
             play_relative(1);
         } else if (key == BSP_INPUT_NAVIGATION_KEY_RETURN || is_space_key(key)) {
             audio_player_toggle_pause();
-        } else if (key == BSP_INPUT_NAVIGATION_KEY_F2 || key == BSP_INPUT_NAVIGATION_KEY_DOWN) {
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
+            adjust_volume(5);
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_DOWN) {
+            adjust_volume(-5);
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_F2) {
             effects_previous();
             reset_effect_automation();
-        } else if (key == BSP_INPUT_NAVIGATION_KEY_F3 || key == BSP_INPUT_NAVIGATION_KEY_UP) {
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_F3) {
             effects_next();
             reset_effect_automation();
         } else if (key == BSP_INPUT_NAVIGATION_KEY_F4 || key == BSP_INPUT_NAVIGATION_KEY_MENU) {
@@ -1022,7 +1059,14 @@ void app_main(void) {
     ESP_ERROR_CHECK(err);
     ESP_ERROR_CHECK(initialize_display_and_bsp());
     app_settings_load(&settings);
+    if (settings.auto_effect_mode > AUTO_EFFECT_TRACK) settings.auto_effect_mode = AUTO_EFFECT_TIME;
+    if (settings.fixed_effect >= EFFECT_COUNT) settings.fixed_effect = EFFECT_PROCEDURAL_FIRST + 48;
+    if (settings.palette_mode > 2) settings.palette_mode = 1;
+    if (settings.palette_index >= 18) settings.palette_index = 0;
+    if (settings.palette_speed > 4) settings.palette_speed = 2;
     effects_set_intensity(settings.visual_intensity);
+    effects_set_palette_controls(settings.palette_mode, settings.palette_index, settings.palette_speed);
+    if (settings.auto_effect_mode == AUTO_EFFECT_OFF) effects_select((effect_id_t)settings.fixed_effect);
     bsp_display_set_backlight_brightness(settings.brightness);
     last_input_time = esp_timer_get_time();
     last_effect_change_time = last_input_time;
