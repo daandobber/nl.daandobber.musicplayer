@@ -95,6 +95,18 @@ static effect_id_t overlay_effect;
 static char overlay_path[AUDIO_PLAYER_PATH_MAX];
 static int64_t now_announce_start;
 
+typedef struct {
+    uint16_t x;
+    uint16_t y;
+    uint16_t color;
+} announce_pixel_t;
+
+static announce_pixel_t *announce_pixels;
+static size_t announce_pixel_count;
+static uint16_t *announce_surface;
+static size_t announce_surface_pixels;
+static char announce_path[AUDIO_PLAYER_PATH_MAX];
+
 static pax_orientation_t display_orientation(void) {
     switch (bsp_display_get_default_rotation()) {
         case BSP_DISPLAY_ROTATION_90: return PAX_O_ROT_CCW;
@@ -367,11 +379,20 @@ static void draw_now_card(pax_buf_t *buffer, const audio_player_snapshot_t *play
                   text_x, NOW_CARD_Y + 96, detail);
 }
 
-static void draw_now_announce(pax_buf_t *buffer, const audio_player_snapshot_t *player,
-                              const audio_analysis_snapshot_t *analysis) {
-    float elapsed = (esp_timer_get_time() - now_announce_start) / 1000000.0f;
-    if (elapsed < .12f || elapsed > 4.6f) return;
+static bool build_announce_pixels(pax_buf_t *buffer, const audio_player_snapshot_t *player) {
+    const int width = pax_buf_get_width(buffer);
+    const int height = 76;
+    size_t surface_pixels = (size_t)width * height;
+    if (surface_pixels > announce_surface_pixels) {
+        uint16_t *surface = realloc(announce_surface, surface_pixels * sizeof(uint16_t));
+        if (!surface) return false;
+        announce_surface = surface;
+        announce_surface_pixels = surface_pixels;
+    }
+    memset(announce_surface, 0, surface_pixels * sizeof(uint16_t));
 
+    pax_buf_t layer;
+    if (!pax_buf_init(&layer, announce_surface, width, height, PAX_BUF_16_565RGB)) return false;
     size_t library_track = media_library_find_path(&library, player->path);
     const media_track_t *metadata = library_track != SIZE_MAX ? &library.tracks[library_track] : NULL;
     const char *title_source = metadata ? metadata->title : media_library_display_name(player->path);
@@ -380,31 +401,46 @@ static void draw_now_announce(pax_buf_t *buffer, const audio_player_snapshot_t *
     clipped_text(title, sizeof(title), title_source, 32);
     clipped_text(artist, sizeof(artist), artist_source, 36);
 
-    pax_col_t accent = effects_palette_color(.82f, analysis->beat_strength);
-    pax_col_t secondary = effects_palette_color(.38f, analysis->beat_strength * .5f);
-    float pulse = .76f + analysis->bass * .24f;
-    int center = pax_buf_get_width(buffer) / 2;
-    int baseline = 338 + (int)(analysis->bass * 7.0f);
-    for (int band = 0; band < 6; band++) {
-        float strength = analysis->bands[band * 2];
-        int length = 18 + (int)(strength * 88.0f);
-        int y = baseline - 31 + band * 10;
-        pax_simple_rect(buffer, color_scale(band & 1 ? accent : secondary, .34f),
-                        center - 260 - length, y, length, 2);
-        pax_simple_rect(buffer, color_scale(band & 1 ? secondary : accent, .34f),
-                        center + 260, y, length, 2);
-    }
-
     pax_vec2f title_size = pax_text_size(pax_font_sky_mono, 25, title);
     pax_vec2f artist_size = pax_text_size(pax_font_sky_mono, 15, artist);
-    float title_x = center - title_size.x * .5f;
-    pax_draw_text(buffer, color_scale(COLOR_TEXT, pulse), pax_font_sky_mono, 25,
-                  title_x, baseline, title);
-    pax_draw_text(buffer, accent, pax_font_sky_mono, 15,
-                  center - artist_size.x * .5f, baseline + 39, artist);
-    int line = 54 + (int)(analysis->rms * 170.0f);
-    pax_simple_rect(buffer, color_scale(accent, .82f), center - line, baseline - 12,
-                    line * 2, 2);
+    pax_col_t accent = effects_palette_color(.82f, 0.0f);
+    pax_draw_text(&layer, COLOR_TEXT, pax_font_sky_mono, 25,
+                  width * .5f - title_size.x * .5f, 2, title);
+    pax_draw_text(&layer, accent, pax_font_sky_mono, 15,
+                  width * .5f - artist_size.x * .5f, 43, artist);
+
+    size_t count = 0;
+    for (size_t i = 0; i < surface_pixels; i++) if (announce_surface[i]) count++;
+    announce_pixel_t *pixels = realloc(announce_pixels, count * sizeof(announce_pixel_t));
+    if (count && !pixels) return false;
+    announce_pixels = pixels;
+    announce_pixel_count = count;
+    size_t output = 0;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            uint16_t color = announce_surface[(size_t)y * width + x];
+            if (!color) continue;
+            announce_pixels[output++] = (announce_pixel_t){.x = x, .y = y, .color = color};
+        }
+    }
+    strlcpy(announce_path, player->path, sizeof(announce_path));
+    return true;
+}
+
+static void draw_now_announce(pax_buf_t *buffer, const audio_player_snapshot_t *player,
+                              const audio_analysis_snapshot_t *analysis) {
+    float elapsed = (esp_timer_get_time() - now_announce_start) / 1000000.0f;
+    if (elapsed < .12f || elapsed > 4.6f || !buffer->buf_16bpp) return;
+    if (strcmp(announce_path, player->path) != 0 && !build_announce_pixels(buffer, player)) return;
+
+    int top = 274 + (int)(analysis->bass * 4.0f);
+    size_t raw_width = buffer->width;
+    for (size_t i = 0; i < announce_pixel_count; i++) {
+        int x = announce_pixels[i].x;
+        int y = top + announce_pixels[i].y;
+        if (x < 0 || x >= (int)pax_buf_get_width(buffer) || y < 0 || y >= (int)pax_buf_get_height(buffer)) continue;
+        buffer->buf_16bpp[(size_t)x * raw_width + (raw_width - 1 - (size_t)y)] = announce_pixels[i].color;
+    }
 }
 
 static void render_now_playing(pax_buf_t *buffer, float dt) {
