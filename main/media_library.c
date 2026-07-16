@@ -310,6 +310,99 @@ static void parse_wav_info(FILE *file, parsed_metadata_t *metadata) {
     }
 }
 
+static void apply_vorbis_comment(const char *field, const uint8_t *value, size_t length, parsed_metadata_t *metadata) {
+    char decoded[META_TEXT_SIZE];
+    size_t take = length < sizeof(decoded) - 1 ? length : sizeof(decoded) - 1;
+    memcpy(decoded, value, take);
+    decoded[take] = '\0';
+    trim(decoded);
+    if (decoded[0] == '\0') return;
+    if (strcasecmp(field, "TITLE") == 0) strlcpy(metadata->title, decoded, sizeof(metadata->title));
+    else if (strcasecmp(field, "ARTIST") == 0) strlcpy(metadata->artist, decoded, sizeof(metadata->artist));
+    else if (strcasecmp(field, "ALBUM") == 0) strlcpy(metadata->album, decoded, sizeof(metadata->album));
+    else if (strcasecmp(field, "TRACKNUMBER") == 0) metadata->track = parse_number(decoded);
+    else if (strcasecmp(field, "DISCNUMBER") == 0) metadata->disc = parse_number(decoded);
+}
+
+static void parse_flac_vorbis_comment(FILE *file, uint32_t block_size, parsed_metadata_t *metadata) {
+    uint8_t length_bytes[4];
+    if (fread(length_bytes, 1, 4, file) != 4) return;
+    uint32_t vendor_length = read_le32(length_bytes);
+    if (vendor_length > block_size || fseek(file, (long)vendor_length, SEEK_CUR) != 0) return;
+    if (fread(length_bytes, 1, 4, file) != 4) return;
+    uint32_t comment_count = read_le32(length_bytes);
+    for (uint32_t i = 0; i < comment_count; i++) {
+        if (fread(length_bytes, 1, 4, file) != 4) break;
+        uint32_t comment_length = read_le32(length_bytes);
+        if (comment_length == 0 || comment_length > 4096) {
+            if (fseek(file, (long)comment_length, SEEK_CUR) != 0) break;
+            continue;
+        }
+        uint8_t *comment = malloc(comment_length);
+        if (!comment) break;
+        if (fread(comment, 1, comment_length, file) != comment_length) {
+            free(comment);
+            break;
+        }
+        uint8_t *equals = memchr(comment, '=', comment_length);
+        if (equals) {
+            char field[32];
+            size_t field_length = (size_t)(equals - comment);
+            if (field_length >= sizeof(field)) field_length = sizeof(field) - 1;
+            memcpy(field, comment, field_length);
+            field[field_length] = '\0';
+            apply_vorbis_comment(field, equals + 1, comment_length - (size_t)(equals - comment) - 1, metadata);
+        }
+        free(comment);
+    }
+}
+
+static void parse_flac_picture(FILE *file, uint32_t block_size, parsed_metadata_t *metadata) {
+    if (metadata->cover_size) return;
+    uint8_t field[4];
+    if (fread(field, 1, 4, file) != 4) return;  // picture type, unused
+    if (fread(field, 1, 4, file) != 4) return;
+    uint32_t mime_length = read_be32(field);
+    if (mime_length > block_size) return;
+    char mime[32] = {0};
+    size_t mime_take = mime_length < sizeof(mime) - 1 ? mime_length : sizeof(mime) - 1;
+    if (mime_take && fread(mime, 1, mime_take, file) != mime_take) return;
+    if (mime_length > mime_take && fseek(file, (long)(mime_length - mime_take), SEEK_CUR) != 0) return;
+    // esp_jpeg only decodes JPEG; skip other embedded picture formats (e.g. PNG).
+    bool is_jpeg = strcasecmp(mime, "image/jpeg") == 0 || strcasecmp(mime, "image/jpg") == 0;
+
+    if (fread(field, 1, 4, file) != 4) return;
+    uint32_t description_length = read_be32(field);
+    if (fseek(file, (long)description_length, SEEK_CUR) != 0) return;
+    if (fseek(file, 16, SEEK_CUR) != 0) return;  // width, height, depth, colors used
+
+    if (fread(field, 1, 4, file) != 4) return;
+    uint32_t data_length = read_be32(field);
+    long data_offset = ftell(file);
+    if (!is_jpeg || data_length == 0 || data_offset < 0 || data_length > block_size) return;
+    metadata->cover_offset = (uint32_t)data_offset;
+    metadata->cover_size = data_length;
+}
+
+static void parse_flac(FILE *file, parsed_metadata_t *metadata) {
+    uint8_t magic[4];
+    rewind(file);
+    if (fread(magic, 1, sizeof(magic), file) != sizeof(magic) || memcmp(magic, "fLaC", 4) != 0) return;
+    for (int blocks = 0; blocks < 64; blocks++) {
+        uint8_t block_header[4];
+        if (fread(block_header, 1, sizeof(block_header), file) != sizeof(block_header)) break;
+        bool last_block = (block_header[0] & 0x80) != 0;
+        uint8_t block_type = block_header[0] & 0x7f;
+        uint32_t block_size = ((uint32_t)block_header[1] << 16) | ((uint32_t)block_header[2] << 8) | block_header[3];
+        long block_offset = ftell(file);
+        if (block_offset < 0) break;
+        if (block_type == 4) parse_flac_vorbis_comment(file, block_size, metadata);
+        else if (block_type == 6) parse_flac_picture(file, block_size, metadata);
+        if (fseek(file, block_offset + (long)block_size, SEEK_SET) != 0) break;
+        if (last_block) break;
+    }
+}
+
 static char *find_folder_cover(const char *track_path, uint32_t *cover_size) {
     static const char *names[] = {
         "cover.jpg", "folder.jpg", "front.jpg", "Cover.jpg", "Folder.jpg",
@@ -352,6 +445,8 @@ static esp_err_t append_track(media_library_t *library, const char *path) {
         if (extension && strcasecmp(extension, ".mp3") == 0) {
             parse_id3v1(file, &metadata);
             parse_id3v2(file, &metadata);
+        } else if (extension && strcasecmp(extension, ".flac") == 0) {
+            parse_flac(file, &metadata);
         } else {
             parse_wav_info(file, &metadata);
         }

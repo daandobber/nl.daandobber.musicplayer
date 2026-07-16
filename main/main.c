@@ -17,11 +17,13 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "lastfm_scrobbler.h"
 #include "media_library.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
 #include "pax_text.h"
+#include "wifi_setup.h"
 
 #define COLOR_BG       0xff060811
 #define COLOR_PANEL    0xff141826
@@ -42,6 +44,7 @@ typedef enum {
     SCREEN_LIBRARY,
     SCREEN_NOW_PLAYING,
     SCREEN_SETTINGS,
+    SCREEN_LASTFM_ACCOUNT,
     SCREEN_ERROR,
 } screen_id_t;
 
@@ -107,6 +110,16 @@ static uint16_t *announce_surface;
 static size_t announce_surface_pixels;
 static char announce_path[AUDIO_PLAYER_PATH_MAX];
 
+static char lastfm_active_path[AUDIO_PLAYER_PATH_MAX] = "";
+static size_t lastfm_active_track = SIZE_MAX;
+static bool lastfm_was_playing = false;
+static size_t lastfm_selected = 0;
+static bool lastfm_editing = false;
+static char lastfm_edit_api_key[80] = "";
+static char lastfm_edit_api_secret[80] = "";
+static char lastfm_edit_username[64] = "";
+static char lastfm_edit_password[96] = "";
+
 static void change_effect_automatically(void);
 
 static pax_orientation_t display_orientation(void) {
@@ -149,6 +162,51 @@ static void draw_header(pax_buf_t *buffer, const char *title, const char *right)
     if (right) {
         pax_vec2f size = pax_text_size(pax_font_sky_mono, 18, right);
         pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 18, width - size.x - 20, 18, right);
+    }
+}
+
+static char *lastfm_field_buffer(size_t field, size_t *out_len) {
+    switch (field) {
+        case 0: *out_len = sizeof(lastfm_edit_api_key); return lastfm_edit_api_key;
+        case 1: *out_len = sizeof(lastfm_edit_api_secret); return lastfm_edit_api_secret;
+        case 2: *out_len = sizeof(lastfm_edit_username); return lastfm_edit_username;
+        case 3: *out_len = sizeof(lastfm_edit_password); return lastfm_edit_password;
+        default: *out_len = 0; return NULL;
+    }
+}
+
+static void load_lastfm_settings_for_edit(void) {
+    lastfm_config_t config;
+    lastfm_scrobbler_get_config(&config);
+    strlcpy(lastfm_edit_api_key, config.api_key, sizeof(lastfm_edit_api_key));
+    strlcpy(lastfm_edit_api_secret, config.api_secret, sizeof(lastfm_edit_api_secret));
+    strlcpy(lastfm_edit_username, config.username, sizeof(lastfm_edit_username));
+    lastfm_edit_password[0] = '\0';
+    lastfm_selected = 0;
+    lastfm_editing = false;
+}
+
+static void mask_value(const char *src, char *out, size_t out_len) {
+    if (out_len == 0) return;
+    size_t length = strlen(src);
+    if (length == 0) {
+        strlcpy(out, "<empty>", out_len);
+        return;
+    }
+    size_t shown = length < out_len - 1 ? length : out_len - 1;
+    memset(out, '*', shown);
+    out[shown] = '\0';
+}
+
+static void append_ascii(char *buf, size_t cap, char c) {
+    size_t length = strlen(buf);
+    if (c == '\b') {
+        if (length > 0) buf[length - 1] = '\0';
+        return;
+    }
+    if (c >= 32 && c <= 126 && length + 1 < cap) {
+        buf[length] = c;
+        buf[length + 1] = '\0';
     }
 }
 
@@ -520,13 +578,14 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
     overlay_time_total += esp_timer_get_time() - overlay_start;
 }
 
-#define SETTINGS_ITEM_COUNT 13
+#define SETTINGS_ITEM_COUNT 15
 
 static const char *setting_label(size_t index) {
     static const char *labels[SETTINGS_ITEM_COUNT] = {
         "Animation switching", "Fixed animation", "Order", "Switch interval",
         "Beats per effect", "Colour behavior", "Colour palette", "Colour speed",
-        "Brightness", "Dim after", "Dim level", "Visual intensity", "Test dimming"
+        "Brightness", "Dim after", "Dim level", "Visual intensity", "Test dimming",
+        "LastFM scrobbling", "Last.fm account"
     };
     return labels[index];
 }
@@ -558,6 +617,16 @@ static void setting_value(size_t index, char *value, size_t value_size) {
         case 10: snprintf(value, value_size, "%u%%", settings.dim_brightness); break;
         case 11: strlcpy(value, intensities[settings.visual_intensity], value_size); break;
         case 12: strlcpy(value, "Press Right", value_size); break;
+        case 13: strlcpy(value, settings.lastfm_enabled ? "On" : "Off", value_size); break;
+        case 14: {
+            lastfm_status_t status;
+            lastfm_scrobbler_get_status(&status);
+            if (status.enabled) snprintf(value, value_size, "Linked: %s", status.username);
+            else if (!status.has_api_key || !status.has_api_secret) strlcpy(value, "Needs API key", value_size);
+            else if (!status.has_session) strlcpy(value, "Not linked", value_size);
+            else strlcpy(value, "Press Right", value_size);
+            break;
+        }
         default: value[0] = '\0'; break;
     }
 }
@@ -585,6 +654,47 @@ static void render_settings(pax_buf_t *buffer) {
                   "Up/Down select    Left/Right change    Esc/F5 back    settings save automatically");
 }
 
+static void render_lastfm_account(pax_buf_t *buffer) {
+    now_card_valid[framebuffer_index] = false;
+    int width = pax_buf_get_width(buffer);
+    pax_background(buffer, COLOR_BG);
+    draw_header(buffer, "MUSICPLAYER // LAST.FM", "Esc");
+
+    lastfm_status_t status;
+    lastfm_scrobbler_get_status(&status);
+    char status_line[160];
+    snprintf(status_line, sizeof(status_line), "%s%s%s", status.enabled ? "Linked" : "Not linked",
+             status.username[0] ? " - " : "", status.username);
+    pax_draw_text(buffer, status.enabled ? COLOR_ACCENT : COLOR_DIM, pax_font_sky_mono, 18, 58, 76, status_line);
+    if (status.last_error[0] != '\0') {
+        pax_draw_text(buffer, COLOR_ERROR, pax_font_sky_mono, 16, 58, 100, status.last_error);
+    }
+
+    static const char *labels[] = {"API key", "Secret", "Username", "Password", "Login + save"};
+    for (size_t i = 0; i < 5; i++) {
+        int y = 140 + (int)i * 39;
+        if (i == lastfm_selected) pax_simple_rect(buffer, COLOR_SELECTED, 42, y - 6, width - 84, 36);
+        pax_col_t color = i == lastfm_selected ? COLOR_TEXT : COLOR_DIM;
+        if (i < 4) {
+            size_t cap;
+            char *field = lastfm_field_buffer(i, &cap);
+            (void)cap;
+            char value[80];
+            if (i == 1 || i == 3) mask_value(field, value, sizeof(value));
+            else strlcpy(value, field[0] != '\0' ? field : "<empty>", sizeof(value));
+            char line[160];
+            snprintf(line, sizeof(line), "%s: %.100s%s", labels[i], value,
+                     lastfm_editing && lastfm_selected == i ? "_" : "");
+            pax_draw_text(buffer, color, pax_font_sky_mono, 18, 58, y, line);
+        } else {
+            pax_draw_text(buffer, color, pax_font_sky_mono, 18, 58, y, labels[i]);
+        }
+    }
+    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, 48, 444,
+                  lastfm_editing ? "Type text    Enter=Done    Esc=Cancel"
+                                 : "Up/Down select    Enter=Edit/Login    Esc=Back");
+}
+
 static void render_error(pax_buf_t *buffer) {
     now_card_valid[framebuffer_index] = false;
     int width = pax_buf_get_width(buffer);
@@ -606,6 +716,7 @@ static void render_frame(float dt) {
         case SCREEN_LIBRARY: render_library(buffer); break;
         case SCREEN_NOW_PLAYING: render_now_playing(buffer, dt); break;
         case SCREEN_SETTINGS: render_settings(buffer); break;
+        case SCREEN_LASTFM_ACCOUNT: render_lastfm_account(buffer); break;
         case SCREEN_ERROR: render_error(buffer); break;
     }
     int64_t present_start = esp_timer_get_time();
@@ -782,6 +893,12 @@ static void apply_settings(void) {
     last_effect_beat = analysis.beat_counter;
 }
 
+static void open_lastfm_account(void) {
+    load_lastfm_settings_for_edit();
+    current_screen = SCREEN_LASTFM_ACCOUNT;
+    render_dirty = true;
+}
+
 static void change_setting(int delta) {
     static const uint16_t seconds[] = {15, 30, 45, 60, 90, 120, 180};
     static const uint16_t beats[] = {8, 16, 32, 64, 96, 128};
@@ -816,6 +933,8 @@ static void change_setting(int delta) {
             ESP_LOGI(TAG, "Dim test: %u%%", settings.dim_brightness);
             ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.dim_brightness));
             break;
+        case 13: settings.lastfm_enabled = !settings.lastfm_enabled; break;
+        case 14: open_lastfm_account(); break;
         default: break;
     }
     apply_settings();
@@ -877,6 +996,38 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
             change_setting(1);
         } else if (key == BSP_INPUT_NAVIGATION_KEY_ESC || key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
             close_settings();
+        }
+        render_dirty = true;
+        return;
+    }
+
+    if (current_screen == SCREEN_LASTFM_ACCOUNT) {
+        if (key == BSP_INPUT_NAVIGATION_KEY_ESC) {
+            if (lastfm_editing) lastfm_editing = false;
+            else current_screen = SCREEN_SETTINGS;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
+            if (!lastfm_editing) lastfm_selected = (lastfm_selected + 4) % 5;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_DOWN || key == BSP_INPUT_NAVIGATION_KEY_TAB) {
+            if (!lastfm_editing) lastfm_selected = (lastfm_selected + 1) % 5;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
+            if (lastfm_editing) {
+                size_t cap;
+                char *field = lastfm_field_buffer(lastfm_selected, &cap);
+                (void)cap;
+                if (field != NULL) {
+                    size_t length = strlen(field);
+                    if (length > 0) field[length - 1] = '\0';
+                }
+            }
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_RETURN) {
+            if (lastfm_selected < 4) {
+                lastfm_editing = !lastfm_editing;
+            } else {
+                esp_err_t res = lastfm_scrobbler_set_api_credentials(lastfm_edit_api_key, lastfm_edit_api_secret);
+                if (res == ESP_OK) res = lastfm_scrobbler_login(lastfm_edit_username, lastfm_edit_password);
+                if (res != ESP_OK) ESP_LOGW(TAG, "Last.fm settings failed: %s", esp_err_to_name(res));
+                lastfm_edit_password[0] = '\0';
+            }
         }
         render_dirty = true;
         return;
@@ -958,6 +1109,16 @@ static void handle_input(const bsp_input_event_t *event) {
     }
     switch (event->type) {
         case INPUT_EVENT_TYPE_NAVIGATION: handle_navigation(&event->args_navigation); break;
+        case INPUT_EVENT_TYPE_KEYBOARD:
+            if (current_screen == SCREEN_LASTFM_ACCOUNT && lastfm_editing) {
+                size_t cap;
+                char *field = lastfm_field_buffer(lastfm_selected, &cap);
+                if (field != NULL) {
+                    append_ascii(field, cap, event->args_keyboard.ascii);
+                    render_dirty = true;
+                }
+            }
+            break;
         case INPUT_EVENT_TYPE_ACTION:
             if (event->args_action.type == BSP_INPUT_ACTION_TYPE_SD_CARD) {
                 if (event->args_action.state) {
@@ -996,6 +1157,41 @@ static void change_effect_automatically(void) {
     now_card_valid[1] = false;
     reset_effect_automation();
     render_dirty = true;
+}
+
+static void build_lastfm_track_info(size_t track_index, lastfm_track_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (track_index >= library.count) return;
+    const media_track_t *track = &library.tracks[track_index];
+    out->artist = track->artist;
+    out->album = track->album;
+    out->track = track->title;
+    out->track_number = track->track_number;
+}
+
+static void update_lastfm_from_playback(const audio_player_snapshot_t *player) {
+    if (!settings.lastfm_enabled) return;
+    bool playing = player->state == AUDIO_PLAYER_PLAYING;
+    bool path_changed = strcmp(player->path, lastfm_active_path) != 0;
+    if (path_changed) {
+        strlcpy(lastfm_active_path, player->path, sizeof(lastfm_active_path));
+        lastfm_active_track = media_library_find_path(&library, player->path);
+    }
+    bool track_changed = path_changed || (playing && !lastfm_was_playing);
+    if (track_changed) {
+        lastfm_scrobbler_track_changed();
+        if (playing && lastfm_active_track != SIZE_MAX) {
+            lastfm_track_info_t info;
+            build_lastfm_track_info(lastfm_active_track, &info);
+            lastfm_scrobbler_now_playing(&info);
+        }
+    }
+    if (playing && lastfm_active_track != SIZE_MAX) {
+        lastfm_track_info_t info;
+        build_lastfm_track_info(lastfm_active_track, &info);
+        lastfm_scrobbler_maybe_scrobble(&info, player->elapsed_seconds);
+    }
+    lastfm_was_playing = playing;
 }
 
 static void update_timers(int64_t now, const audio_player_snapshot_t *player) {
@@ -1071,6 +1267,9 @@ void app_main(void) {
     last_input_time = esp_timer_get_time();
     last_effect_change_time = last_input_time;
 
+    ESP_ERROR_CHECK(wifi_setup_init());
+    ESP_ERROR_CHECK(lastfm_scrobbler_init());
+
     err = audio_player_init();
     if (err != ESP_OK) {
         snprintf(error_message, sizeof(error_message), "Audio initialization failed (%s)", esp_err_to_name(err));
@@ -1105,6 +1304,8 @@ void app_main(void) {
         audio_player_get_snapshot(&player);
         int64_t now = esp_timer_get_time();
         update_timers(now, &player);
+        update_lastfm_from_playback(&player);
+        if (lastfm_scrobbler_consume_dirty() && current_screen == SCREEN_LASTFM_ACCOUNT) render_dirty = true;
         bool animate = current_screen == SCREEN_NOW_PLAYING && player.state == AUDIO_PLAYER_PLAYING;
         if (animate && now - previous_frame >= 16667) render_dirty = true;  // 60 FPS target.
         if (render_dirty) {

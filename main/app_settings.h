@@ -23,6 +23,7 @@ typedef struct {
     uint8_t palette_mode;
     uint8_t palette_index;
     uint8_t palette_speed;
+    uint8_t lastfm_enabled;
 } app_settings_t;
 
 void app_settings_load(app_settings_t *settings);

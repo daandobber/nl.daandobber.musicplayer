@@ -19,6 +19,7 @@ static const app_settings_t defaults = {
     .palette_mode = 1,
     .palette_index = 0,
     .palette_speed = 2,
+    .lastfm_enabled = 0,
 };
 
 void app_settings_load(app_settings_t *settings) {

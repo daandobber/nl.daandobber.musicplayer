@@ -11,9 +11,9 @@ the ESP32-P4.
 
 ## Features
 
-- Recursively finds MP3 and WAV files on the microSD card.
-- MP3 and 8/16/24/32-bit mono/stereo WAV playback through the ES8156 codec.
-- Artist/album library with ID3v1/ID3v2 and WAV `LIST/INFO` metadata, plus filename/folder fallbacks.
+- Recursively finds MP3, WAV, and FLAC files on the microSD card.
+- MP3, 8/16/24/32-bit mono/stereo WAV, and FLAC playback through the ES8156 codec.
+- Artist/album library with ID3v1/ID3v2, WAV `LIST/INFO`, and FLAC Vorbis comment metadata, plus filename/folder fallbacks.
 - Editable play queue: replace it with an artist or album, append selections, and remove tracks.
 - Hardware volume control and speaker/headphone handling through the Tanmatsu BSP.
 - 12-band FFT, RMS, peak and beat analysis of the PCM that is sent to I2S.
@@ -22,7 +22,8 @@ the ESP32-P4.
 - Slow fluid transitions advect the previous image through a vector field while the next algorithm emerges.
 - Instant preset switching without an expensive full-frame crossfade.
 - Persistent settings for timed/beat-based automatic effect switching, shuffle, visual intensity, brightness and idle dimming.
-- Real JPEG album art from MP3 ID3 `APIC` or nearby `cover.jpg`, `folder.jpg`, or `front.jpg`; generated art is the fallback.
+- Real JPEG album art from MP3 ID3 `APIC`, FLAC `PICTURE` blocks, or nearby `cover.jpg`, `folder.jpg`, or `front.jpg`; generated art is the fallback.
+- Scrobble playback to Last.fm automatically when Last.fm is configured and enabled in settings.
 
 ## Controls
 
@@ -42,15 +43,33 @@ the ESP32-P4.
 | Any screen | F5 | Open / close settings |
 | Settings | Up / Down, Left / Right | Select and change a setting |
 | Settings | `Test dimming`, Right | Immediately test the configured dim level |
+| Settings | `Last.fm account`, Right | Open the Last.fm account screen |
+| Last.fm account | Up / Down, Return | Select a field, Return to edit/login, Escape to cancel/back |
 | Player | Escape | Return to library while audio keeps playing |
 | Any | Side `+` / `-` | Volume |
 | Any | F1 | Stop audio and return to launcher |
 
+## Last.fm scrobbling
+
+Last.fm needs an API key and shared secret from
+https://www.last.fm/api/account/create. Open settings with `F5`, scroll to
+`Last.fm account`, fill in the API key, shared secret, username and password
+(Return toggles editing a field, Return on `Login + save` submits), then set
+`LastFM scrobbling` to `On`. MusicPlayer stores the API credentials and the
+Last.fm session key in NVS; the password is only used for that login request
+and is never saved.
+
+Scrobbling requires WiFi. There is no WiFi setup screen in MusicPlayer itself
+- it connects using whatever network is already configured on the device (for
+example through another Tanmatsu app that saves WiFi credentials, such as
+Disc-O-Matsu, or the badge's own WiFi settings). WiFi is only brought up for
+the duration of each Last.fm request and disconnected afterward.
+
 ## Build environment
 
 The project targets ESP-IDF 5.5.1 and ESP32-P4. It uses managed components for
-`badge-bsp`, PAX, `esp_audio_codec`, and `esp-dsp`. SDK and toolchain paths are
-kept outside this repository.
+`badge-bsp`, PAX, `esp_audio_codec`, `esp-dsp`, and `tanmatsu-wifi` (for Last.fm
+scrobbling). SDK and toolchain paths are kept outside this repository.
 
 The plasma and metaballs algorithms are adapted from the MIT-0 licensed
 `esp_effects` project by Mika Tuupola. The rendering and all audio-reactive
