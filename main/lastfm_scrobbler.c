@@ -270,27 +270,48 @@ static bool ensure_time_valid(void) {
 
 static void handle_track_response(const lastfm_request_t *req, const uint8_t *buf, size_t len) {
     if (strcmp(req->method, "track.updateNowPlaying") == 0) {
-        clear_error();
         return;
     }
 
     cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
+    cJSON *api_error = root ? cJSON_GetObjectItem(root, "error") : NULL;
+    cJSON *api_message = root ? cJSON_GetObjectItem(root, "message") : NULL;
+    if (cJSON_IsNumber(api_error)) {
+        set_error("lastfm %d %.64s", api_error->valueint,
+                  cJSON_IsString(api_message) ? api_message->valuestring : "");
+        s_scrobbled_current = false;
+        if (root) cJSON_Delete(root);
+        return;
+    }
+
     cJSON *scrobbles = root ? cJSON_GetObjectItem(root, "scrobbles") : NULL;
     cJSON *scrobble = scrobbles ? cJSON_GetObjectItem(scrobbles, "scrobble") : NULL;
     cJSON *ignored = scrobble ? cJSON_GetObjectItem(scrobble, "ignoredMessage") : NULL;
-    cJSON *ignored_code = ignored ? cJSON_GetObjectItem(ignored, "code") : NULL;
-    const char *ignored_text = cJSON_IsString(ignored) ? ignored->valuestring : "";
-    if ((cJSON_IsString(ignored) && ignored->valuestring[0] != '\0') ||
-        (cJSON_IsNumber(ignored_code) && ignored_code->valueint != 0)) {
-        set_error("scrobble ignored %d %.56s",
-                  cJSON_IsNumber(ignored_code) ? ignored_code->valueint : 0, ignored_text);
+    cJSON *ignored_code = cJSON_IsObject(ignored) ? cJSON_GetObjectItem(ignored, "code") : NULL;
+    cJSON *ignored_text_value = cJSON_IsObject(ignored) ? cJSON_GetObjectItem(ignored, "#text") : NULL;
+    const char *ignored_text = cJSON_IsString(ignored) ? ignored->valuestring :
+                               (cJSON_IsString(ignored_text_value) ? ignored_text_value->valuestring : "");
+    int code = cJSON_IsNumber(ignored_code) ? ignored_code->valueint : 0;
+    if ((ignored_text != NULL && ignored_text[0] != '\0') || code != 0) {
+        set_error("scrobble ignored %d %.56s", code, ignored_text);
+        s_scrobbled_current = false;
     } else if (scrobble != NULL) {
         clear_error();
         ESP_LOGI(TAG, "Scrobble accepted: %s - %s", req->artist, req->track);
     } else {
         set_error("scrobble response");
+        s_scrobbled_current = false;
     }
     if (root) cJSON_Delete(root);
+}
+
+static void startup_time_sync_task(void *arg) {
+    (void)arg;
+    if (wifi_setup_connect_blocking(15000)) {
+        if (!ensure_time_valid()) set_error("no time sync");
+        wifi_setup_disconnect();
+    }
+    vTaskDelete(NULL);
 }
 
 static int append_pair(char *body, size_t cap, size_t pos, const char *key, const char *value) {
@@ -324,6 +345,7 @@ static void request_task(void *arg) {
     if (strcmp(req->method, "track.scrobble") == 0) {
         if (!ensure_time_valid()) {
             set_error("no time sync");
+            s_scrobbled_current = false;
             goto done_wifi;
         }
         time_t now = time(NULL);
@@ -422,6 +444,7 @@ esp_err_t lastfm_scrobbler_init(void) {
 
     load_api_credentials();
     load_session();
+    xTaskCreate(startup_time_sync_task, "lastfm_time", 4096, NULL, 2, NULL);
     if (api_configured() && s_session_key[0] == '\0' && CONFIG_MUSICPLAYER_LASTFM_BOOTSTRAP_USERNAME[0] != '\0' &&
         CONFIG_MUSICPLAYER_LASTFM_BOOTSTRAP_PASSWORD[0] != '\0') {
         return lastfm_scrobbler_login(
