@@ -99,6 +99,7 @@ static esp_audio_simple_dec_type_t decoder_type_for_path(const char *path) {
     const char *extension = strrchr(path, '.');
     if (extension && strcasecmp(extension, ".mp3") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     if (extension && strcasecmp(extension, ".wav") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_WAV;
+    if (extension && strcasecmp(extension, ".flac") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
     return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
 }
 

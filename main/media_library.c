@@ -34,7 +34,8 @@ typedef struct {
 static bool is_media_file(const char *name) {
     const char *extension = strrchr(name, '.');
     return extension != NULL &&
-           (strcasecmp(extension, ".mp3") == 0 || strcasecmp(extension, ".wav") == 0);
+           (strcasecmp(extension, ".mp3") == 0 || strcasecmp(extension, ".wav") == 0 ||
+            strcasecmp(extension, ".flac") == 0);
 }
 
 static void trim(char *text) {
