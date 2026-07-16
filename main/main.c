@@ -129,11 +129,6 @@ static char lastfm_edit_api_key[80] = "";
 static char lastfm_edit_api_secret[80] = "";
 static char lastfm_edit_username[64] = "";
 static char lastfm_edit_password[96] = "";
-static size_t jellyfin_selected = 0;
-static bool jellyfin_editing = false;
-static char jellyfin_edit_url[160] = "";
-static char jellyfin_edit_token[128] = "";
-static char jellyfin_edit_user_id[64] = "";
 
 static void change_effect_automatically(void);
 
@@ -190,15 +185,6 @@ static char *lastfm_field_buffer(size_t field, size_t *out_len) {
     }
 }
 
-static char *jellyfin_field_buffer(size_t field, size_t *out_len) {
-    switch (field) {
-        case 0: *out_len = sizeof(jellyfin_edit_url); return jellyfin_edit_url;
-        case 1: *out_len = sizeof(jellyfin_edit_token); return jellyfin_edit_token;
-        case 2: *out_len = sizeof(jellyfin_edit_user_id); return jellyfin_edit_user_id;
-        default: *out_len = 0; return NULL;
-    }
-}
-
 static void load_lastfm_settings_for_edit(void) {
     lastfm_config_t config;
     lastfm_scrobbler_get_config(&config);
@@ -208,14 +194,6 @@ static void load_lastfm_settings_for_edit(void) {
     lastfm_edit_password[0] = '\0';
     lastfm_selected = 0;
     lastfm_editing = false;
-}
-
-static void load_jellyfin_settings_for_edit(void) {
-    jellyfin_edit_url[0] = '\0';
-    jellyfin_edit_token[0] = '\0';
-    jellyfin_edit_user_id[0] = '\0';
-    jellyfin_selected = 0;
-    jellyfin_editing = false;
 }
 
 static void mask_value(const char *src, char *out, size_t out_len) {
@@ -636,7 +614,7 @@ static const char *visual_setting_label(size_t index) {
     static const char *labels[VISUAL_SETTINGS_COUNT] = {
         "Animation switching", "Fixed animation", "Order", "Switch interval",
         "Beats per effect", "Colour behavior", "Colour palette", "Colour speed",
-        "Brightness", "Dim after", "Dim level", "Visual intensity", "Test dimming"
+        "Brightness", "Screen off after", "Idle screen", "Visual intensity", "Test screen off"
     };
     return labels[index];
 }
@@ -676,11 +654,8 @@ static void visual_setting_value(size_t index, char *value, size_t value_size) {
         case 6: strlcpy(value, palettes[settings.palette_index], value_size); break;
         case 7: strlcpy(value, colour_speeds[settings.palette_speed], value_size); break;
         case 8: snprintf(value, value_size, "%u%%", settings.brightness); break;
-        case 9:
-            if (settings.dim_timeout_seconds == 0) strlcpy(value, "Never", value_size);
-            else snprintf(value, value_size, "%u sec", settings.dim_timeout_seconds);
-            break;
-        case 10: snprintf(value, value_size, "%u%%", settings.dim_brightness); break;
+        case 9: snprintf(value, value_size, "%u sec", settings.dim_timeout_seconds); break;
+        case 10: strlcpy(value, "Off", value_size); break;
         case 11: strlcpy(value, intensities[settings.visual_intensity], value_size); break;
         case 12: strlcpy(value, "Press Right", value_size); break;
         default: value[0] = '\0'; break;
@@ -996,6 +971,8 @@ static void apply_settings(void) {
     if (settings.palette_mode > 2) settings.palette_mode = 1;
     if (settings.palette_index >= 18) settings.palette_index = 0;
     if (settings.palette_speed > 4) settings.palette_speed = 2;
+    if (settings.dim_timeout_seconds == 0) settings.dim_timeout_seconds = 120;
+    settings.dim_brightness = 0;
     effects_set_intensity(settings.visual_intensity);
     effects_set_palette_controls(settings.palette_mode, settings.palette_index, settings.palette_speed);
     if (settings.auto_effect_mode == AUTO_EFFECT_OFF) effects_select((effect_id_t)settings.fixed_effect);
@@ -1014,7 +991,6 @@ static void open_lastfm_account(void) {
 }
 
 static void open_jellyfin_account(void) {
-    load_jellyfin_settings_for_edit();
     current_screen = SCREEN_JELLYFIN_ACCOUNT;
     render_dirty = true;
 }
@@ -1022,7 +998,7 @@ static void open_jellyfin_account(void) {
 static void change_visual_setting(int delta) {
     static const uint16_t seconds[] = {15, 30, 45, 60, 90, 120, 180};
     static const uint16_t beats[] = {8, 16, 32, 64, 96, 128};
-    static const uint16_t dim_times[] = {0, 30, 60, 120, 300, 600};
+    static const uint16_t dim_times[] = {30, 60, 120, 300, 600};
     switch (selected_setting) {
         case 0: settings.auto_effect_mode = (settings.auto_effect_mode + (delta > 0 ? 1 : 3)) % 4; break;
         case 1:
@@ -1042,16 +1018,13 @@ static void change_visual_setting(int delta) {
             break;
         }
         case 9: settings.dim_timeout_seconds = cycle_choice(settings.dim_timeout_seconds, dim_times, sizeof(dim_times) / sizeof(dim_times[0]), delta); break;
-        case 10: {
-            int value = settings.dim_brightness + delta * 10;
-            settings.dim_brightness = value < 0 ? 60 : (value > 60 ? 0 : value);
-            break;
-        }
+        case 10: settings.dim_brightness = 0; break;
         case 11: settings.visual_intensity = (settings.visual_intensity + (delta > 0 ? 1 : 2)) % 3; break;
         case 12:
             display_dimmed = true;
-            ESP_LOGI(TAG, "Dim test: %u%%", settings.dim_brightness);
-            ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.dim_brightness));
+            render_dirty = false;
+            ESP_LOGI(TAG, "Screen off test");
+            ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(0));
             break;
         default: break;
     }
@@ -1261,6 +1234,9 @@ static void handle_input(const bsp_input_event_t *event) {
             display_dimmed = false;
             ESP_LOGI(TAG, "Display wake: %u%%", settings.brightness);
             ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.brightness));
+            now_card_valid[0] = false;
+            now_card_valid[1] = false;
+            render_dirty = true;
         }
     }
     switch (event->type) {
@@ -1354,9 +1330,9 @@ static void update_timers(int64_t now, const audio_player_snapshot_t *player) {
     if (!display_dimmed && settings.dim_timeout_seconds &&
         now - last_input_time >= (int64_t)settings.dim_timeout_seconds * 1000000) {
         display_dimmed = true;
-        ESP_LOGI(TAG, "Display idle dim after %u sec: %u%%", settings.dim_timeout_seconds,
-                 settings.dim_brightness);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.dim_brightness));
+        render_dirty = false;
+        ESP_LOGI(TAG, "Display off after %u sec idle", settings.dim_timeout_seconds);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(0));
     }
     if (current_screen != SCREEN_NOW_PLAYING || player->state != AUDIO_PLAYER_PLAYING ||
         settings.auto_effect_mode == AUTO_EFFECT_OFF) return;
@@ -1463,9 +1439,9 @@ void app_main(void) {
         update_timers(now, &player);
         update_lastfm_from_playback(&player);
         if (lastfm_scrobbler_consume_dirty() && current_screen == SCREEN_LASTFM_ACCOUNT) render_dirty = true;
-        bool animate = current_screen == SCREEN_NOW_PLAYING && player.state == AUDIO_PLAYER_PLAYING;
+        bool animate = !display_dimmed && current_screen == SCREEN_NOW_PLAYING && player.state == AUDIO_PLAYER_PLAYING;
         if (animate && now - previous_frame >= 16667) render_dirty = true;  // 60 FPS target.
-        if (render_dirty) {
+        if (render_dirty && !display_dimmed) {
             float dt = (now - previous_frame) / 1000000.0f;
             if (dt <= 0.0f) dt = 1.0f / 30.0f;
             if (dt > 0.25f) dt = 0.25f;

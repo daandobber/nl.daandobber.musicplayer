@@ -25,6 +25,8 @@
 #define LASTFM_SCROBBLE_AFTER_SEC 30
 #define LASTFM_NVS_NAMESPACE "musicplayer_lfm"
 
+static const char *TAG = "lastfm";
+
 #ifndef CONFIG_MUSICPLAYER_LASTFM_API_KEY
 #define CONFIG_MUSICPLAYER_LASTFM_API_KEY ""
 #endif
@@ -88,6 +90,13 @@ static void set_session(const char *username, const char *session_key) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     snprintf(s_username, sizeof(s_username), "%s", username ? username : "");
     snprintf(s_session_key, sizeof(s_session_key), "%s", session_key ? session_key : "");
+    s_last_error[0] = '\0';
+    xSemaphoreGive(s_mutex);
+    s_dirty = true;
+}
+
+static void clear_error(void) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_last_error[0] = '\0';
     xSemaphoreGive(s_mutex);
     s_dirty = true;
@@ -259,6 +268,31 @@ static bool ensure_time_valid(void) {
     return false;
 }
 
+static void handle_track_response(const lastfm_request_t *req, const uint8_t *buf, size_t len) {
+    if (strcmp(req->method, "track.updateNowPlaying") == 0) {
+        clear_error();
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
+    cJSON *scrobbles = root ? cJSON_GetObjectItem(root, "scrobbles") : NULL;
+    cJSON *scrobble = scrobbles ? cJSON_GetObjectItem(scrobbles, "scrobble") : NULL;
+    cJSON *ignored = scrobble ? cJSON_GetObjectItem(scrobble, "ignoredMessage") : NULL;
+    cJSON *ignored_code = ignored ? cJSON_GetObjectItem(ignored, "code") : NULL;
+    const char *ignored_text = cJSON_IsString(ignored) ? ignored->valuestring : "";
+    if ((cJSON_IsString(ignored) && ignored->valuestring[0] != '\0') ||
+        (cJSON_IsNumber(ignored_code) && ignored_code->valueint != 0)) {
+        set_error("scrobble ignored %d %.56s",
+                  cJSON_IsNumber(ignored_code) ? ignored_code->valueint : 0, ignored_text);
+    } else if (scrobble != NULL) {
+        clear_error();
+        ESP_LOGI(TAG, "Scrobble accepted: %s - %s", req->artist, req->track);
+    } else {
+        set_error("scrobble response");
+    }
+    if (root) cJSON_Delete(root);
+}
+
 static int append_pair(char *body, size_t cap, size_t pos, const char *key, const char *value) {
     int next = snprintf(body + pos, cap - pos, "%s%s=", pos > 0 ? "&" : "", key);
     if (next < 0 || pos + (size_t)next >= cap) return -1;
@@ -350,7 +384,7 @@ static void request_task(void *arg) {
         }
         if (root) cJSON_Delete(root);
     } else {
-        set_error("");
+        handle_track_response(req, buf, len);
     }
 
 done_wifi:
