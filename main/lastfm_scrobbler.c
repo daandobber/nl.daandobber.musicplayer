@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/apps/sntp.h"
 #include "mbedtls/md5.h"
 #include "nvs.h"
 #include "sdkconfig.h"
@@ -49,6 +50,7 @@ typedef struct {
     char api_secret[80];
     int track_number;
     uint32_t duration_sec;
+    uint32_t elapsed_sec;
     uint32_t timestamp;
 } lastfm_request_t;
 
@@ -66,6 +68,7 @@ static char s_api_secret[80]     = CONFIG_MUSICPLAYER_LASTFM_API_SECRET;
 static char s_last_error[96]     = "";
 static bool s_scrobbled_current  = false;
 static volatile bool s_dirty     = false;
+static bool s_sntp_started       = false;
 
 static bool api_configured(void) {
     return s_api_key[0] != '\0' && s_api_secret[0] != '\0';
@@ -236,6 +239,26 @@ static void sign_track(const lastfm_request_t *req, char out[33]) {
     md5_hex(sig_src, out);
 }
 
+static bool ensure_time_valid(void) {
+    time_t now = time(NULL);
+    if (now >= 1600000000) return true;
+
+    if (!s_sntp_started) {
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, "pool.ntp.org");
+        sntp_setservername(1, "time.google.com");
+        sntp_init();
+        s_sntp_started = true;
+    }
+
+    for (int i = 0; i < 50; i++) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        now = time(NULL);
+        if (now >= 1600000000) return true;
+    }
+    return false;
+}
+
 static int append_pair(char *body, size_t cap, size_t pos, const char *key, const char *value) {
     int next = snprintf(body + pos, cap - pos, "%s%s=", pos > 0 ? "&" : "", key);
     if (next < 0 || pos + (size_t)next >= cap) return -1;
@@ -262,6 +285,16 @@ static void request_task(void *arg) {
     if (!wifi_setup_connect_blocking(15000)) {
         set_error("no wifi");
         goto done;
+    }
+
+    if (strcmp(req->method, "track.scrobble") == 0) {
+        if (!ensure_time_valid()) {
+            set_error("no time sync");
+            goto done_wifi;
+        }
+        time_t now = time(NULL);
+        req->timestamp = (uint32_t)now;
+        if (req->timestamp > req->elapsed_sec) req->timestamp -= req->elapsed_sec;
     }
 
     char api_sig[33];
@@ -346,7 +379,6 @@ static bool fill_track_request(lastfm_request_t *req, const char *method, const 
     snprintf(req->track, sizeof(req->track), "%s", track->track);
     req->track_number = track->track_number;
     req->duration_sec = track->duration_sec;
-    req->timestamp = (uint32_t)time(NULL);
     return true;
 }
 
@@ -439,12 +471,7 @@ void lastfm_scrobbler_maybe_scrobble(const lastfm_track_info_t *track, uint32_t 
         free(req);
         return;
     }
-    if (req->timestamp < 1600000000u) {
-        free(req);
-        return;
-    }
-    // Last.fm wants the start time, not the time we crossed the threshold.
-    if (req->timestamp > elapsed_sec) req->timestamp -= elapsed_sec;
+    req->elapsed_sec = elapsed_sec;
     s_scrobbled_current = true;
     xTaskCreate(request_task, "lastfm_scrob", 12288, req, 3, NULL);
 }
