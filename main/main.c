@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "jellyfin_client.h"
 #include "lastfm_scrobbler.h"
 #include "media_library.h"
 #include "nvs_flash.h"
@@ -44,9 +45,17 @@ typedef enum {
     SCREEN_LIBRARY,
     SCREEN_NOW_PLAYING,
     SCREEN_SETTINGS,
+    SCREEN_JELLYFIN_ACCOUNT,
     SCREEN_LASTFM_ACCOUNT,
     SCREEN_ERROR,
 } screen_id_t;
+
+typedef enum {
+    SETTINGS_TAB_VISUALS,
+    SETTINGS_TAB_NETWORK,
+    SETTINGS_TAB_LASTFM,
+    SETTINGS_TAB_COUNT,
+} settings_tab_t;
 
 typedef enum {
     LIBRARY_PANE_ARTISTS = 0,
@@ -75,6 +84,7 @@ static library_pane_t library_focus = LIBRARY_PANE_ARTISTS;
 static screen_id_t current_screen = SCREEN_LIBRARY;
 static screen_id_t settings_return_screen = SCREEN_LIBRARY;
 static app_settings_t settings;
+static settings_tab_t settings_tab;
 static size_t selected_setting;
 static int64_t last_input_time;
 static int64_t last_effect_change_time;
@@ -119,6 +129,11 @@ static char lastfm_edit_api_key[80] = "";
 static char lastfm_edit_api_secret[80] = "";
 static char lastfm_edit_username[64] = "";
 static char lastfm_edit_password[96] = "";
+static size_t jellyfin_selected = 0;
+static bool jellyfin_editing = false;
+static char jellyfin_edit_url[160] = "";
+static char jellyfin_edit_token[128] = "";
+static char jellyfin_edit_user_id[64] = "";
 
 static void change_effect_automatically(void);
 
@@ -175,15 +190,34 @@ static char *lastfm_field_buffer(size_t field, size_t *out_len) {
     }
 }
 
+static char *jellyfin_field_buffer(size_t field, size_t *out_len) {
+    switch (field) {
+        case 0: *out_len = sizeof(jellyfin_edit_url); return jellyfin_edit_url;
+        case 1: *out_len = sizeof(jellyfin_edit_token); return jellyfin_edit_token;
+        case 2: *out_len = sizeof(jellyfin_edit_user_id); return jellyfin_edit_user_id;
+        default: *out_len = 0; return NULL;
+    }
+}
+
 static void load_lastfm_settings_for_edit(void) {
     lastfm_config_t config;
     lastfm_scrobbler_get_config(&config);
     strlcpy(lastfm_edit_api_key, config.api_key, sizeof(lastfm_edit_api_key));
-    strlcpy(lastfm_edit_api_secret, config.api_secret, sizeof(lastfm_edit_api_secret));
+    lastfm_edit_api_secret[0] = '\0';
     strlcpy(lastfm_edit_username, config.username, sizeof(lastfm_edit_username));
     lastfm_edit_password[0] = '\0';
     lastfm_selected = 0;
     lastfm_editing = false;
+}
+
+static void load_jellyfin_settings_for_edit(void) {
+    jellyfin_config_t config;
+    jellyfin_client_get_config(&config);
+    strlcpy(jellyfin_edit_url, config.url, sizeof(jellyfin_edit_url));
+    jellyfin_edit_token[0] = '\0';
+    strlcpy(jellyfin_edit_user_id, config.user_id, sizeof(jellyfin_edit_user_id));
+    jellyfin_selected = 0;
+    jellyfin_editing = false;
 }
 
 static void mask_value(const char *src, char *out, size_t out_len) {
@@ -578,19 +612,53 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
     overlay_time_total += esp_timer_get_time() - overlay_start;
 }
 
-#define SETTINGS_ITEM_COUNT 15
+#define VISUAL_SETTINGS_COUNT 13
+#define NETWORK_SETTINGS_COUNT 3
+#define LASTFM_SETTINGS_COUNT 2
 
-static const char *setting_label(size_t index) {
-    static const char *labels[SETTINGS_ITEM_COUNT] = {
+static size_t settings_item_count(void) {
+    switch (settings_tab) {
+        case SETTINGS_TAB_VISUALS: return VISUAL_SETTINGS_COUNT;
+        case SETTINGS_TAB_NETWORK: return NETWORK_SETTINGS_COUNT;
+        case SETTINGS_TAB_LASTFM: return LASTFM_SETTINGS_COUNT;
+        default: return VISUAL_SETTINGS_COUNT;
+    }
+}
+
+static const char *settings_tab_name(settings_tab_t tab) {
+    switch (tab) {
+        case SETTINGS_TAB_VISUALS: return "Visuals";
+        case SETTINGS_TAB_NETWORK: return "Network drives";
+        case SETTINGS_TAB_LASTFM: return "Last.fm";
+        default: return "";
+    }
+}
+
+static const char *visual_setting_label(size_t index) {
+    static const char *labels[VISUAL_SETTINGS_COUNT] = {
         "Animation switching", "Fixed animation", "Order", "Switch interval",
         "Beats per effect", "Colour behavior", "Colour palette", "Colour speed",
-        "Brightness", "Dim after", "Dim level", "Visual intensity", "Test dimming",
-        "LastFM scrobbling", "Last.fm account"
+        "Brightness", "Dim after", "Dim level", "Visual intensity", "Test dimming"
     };
     return labels[index];
 }
 
-static void setting_value(size_t index, char *value, size_t value_size) {
+static const char *setting_label(size_t index) {
+    static const char *network_labels[NETWORK_SETTINGS_COUNT] = {
+        "Jellyfin source", "Jellyfin account", "Reload library"
+    };
+    static const char *lastfm_labels[LASTFM_SETTINGS_COUNT] = {
+        "LastFM scrobbling", "Last.fm account"
+    };
+    switch (settings_tab) {
+        case SETTINGS_TAB_VISUALS: return visual_setting_label(index);
+        case SETTINGS_TAB_NETWORK: return network_labels[index];
+        case SETTINGS_TAB_LASTFM: return lastfm_labels[index];
+        default: return "";
+    }
+}
+
+static void visual_setting_value(size_t index, char *value, size_t value_size) {
     static const char *modes[] = {"Off", "Timed", "On beats", "Per track"};
     static const char *intensities[] = {"Calm", "Normal", "Intense"};
     static const char *colour_modes[] = {"Fixed", "Flow", "Beat step"};
@@ -617,8 +685,26 @@ static void setting_value(size_t index, char *value, size_t value_size) {
         case 10: snprintf(value, value_size, "%u%%", settings.dim_brightness); break;
         case 11: strlcpy(value, intensities[settings.visual_intensity], value_size); break;
         case 12: strlcpy(value, "Press Right", value_size); break;
-        case 13: strlcpy(value, settings.lastfm_enabled ? "On" : "Off", value_size); break;
-        case 14: {
+        default: value[0] = '\0'; break;
+    }
+}
+
+static void setting_value(size_t index, char *value, size_t value_size) {
+    if (settings_tab == SETTINGS_TAB_VISUALS) {
+        visual_setting_value(index, value, value_size);
+        return;
+    }
+    if (settings_tab == SETTINGS_TAB_NETWORK) {
+        if (index == 0) {
+            strlcpy(value, jellyfin_client_configured() ? "Configured" : "Off", value_size);
+        } else {
+            strlcpy(value, "Press Right", value_size);
+        }
+        return;
+    }
+    switch (index) {
+        case 0: strlcpy(value, settings.lastfm_enabled ? "On" : "Off", value_size); break;
+        case 1: {
             lastfm_status_t status;
             lastfm_scrobbler_get_status(&status);
             if (status.enabled) snprintf(value, value_size, "Linked: %s", status.username);
@@ -635,12 +721,19 @@ static void render_settings(pax_buf_t *buffer) {
     now_card_valid[framebuffer_index] = false;
     int width = pax_buf_get_width(buffer);
     pax_background(buffer, COLOR_BG);
-    draw_header(buffer, "MUSICPLAYER // SETTINGS", "F5");
+    draw_header(buffer, "MUSICPLAYER // SETTINGS", settings_tab_name(settings_tab));
+    for (size_t tab = 0; tab < SETTINGS_TAB_COUNT; tab++) {
+        int x = 46 + (int)tab * 178;
+        pax_col_t color = tab == settings_tab ? COLOR_ACCENT : COLOR_DIM;
+        pax_draw_text(buffer, color, pax_font_sky_mono, 13, x, 49, settings_tab_name((settings_tab_t)tab));
+        if (tab == settings_tab) pax_simple_rect(buffer, COLOR_ACCENT, x, 63, 126, 3);
+    }
     const size_t rows = 9;
-    size_t first = visible_start(selected_setting, SETTINGS_ITEM_COUNT, rows);
-    for (size_t row = 0; row < rows && first + row < SETTINGS_ITEM_COUNT; row++) {
+    size_t count = settings_item_count();
+    size_t first = visible_start(selected_setting, count, rows);
+    for (size_t row = 0; row < rows && first + row < count; row++) {
         size_t i = first + row;
-        int y = 66 + row * 39;
+        int y = 86 + row * 39;
         if (i == selected_setting) pax_simple_rect(buffer, COLOR_SELECTED, 42, y - 6, width - 84, 36);
         pax_draw_text(buffer, i == selected_setting ? COLOR_TEXT : COLOR_DIM,
                       pax_font_sky_mono, 18, 58, y, setting_label(i));
@@ -651,7 +744,52 @@ static void render_settings(pax_buf_t *buffer) {
                       pax_font_sky_mono, 18, width - 58 - size.x, y, value);
     }
     pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, 48, 444,
-                  "Up/Down select    Left/Right change    Esc/F5 back    settings save automatically");
+                  "Tab section    Up/Down select    Left/Right change    Esc/F5 back");
+}
+
+static void render_jellyfin_account(pax_buf_t *buffer) {
+    now_card_valid[framebuffer_index] = false;
+    int width = pax_buf_get_width(buffer);
+    pax_background(buffer, COLOR_BG);
+    draw_header(buffer, "MUSICPLAYER // NETWORK", "Esc");
+
+    jellyfin_config_t status;
+    jellyfin_client_get_config(&status);
+    char status_line[160];
+    snprintf(status_line, sizeof(status_line), "%s%s%.72s",
+             jellyfin_client_configured() ? "Jellyfin configured" : "Jellyfin not configured",
+             status.url[0] ? " - " : "", status.url);
+    pax_draw_text(buffer, jellyfin_client_configured() ? COLOR_ACCENT : COLOR_DIM,
+                  pax_font_sky_mono, 18, 58, 76, status_line);
+
+    static const char *labels[] = {"Server URL", "API token", "User ID", "Save + reload"};
+    for (size_t i = 0; i < 4; i++) {
+        int y = 140 + (int)i * 39;
+        if (i == jellyfin_selected) pax_simple_rect(buffer, COLOR_SELECTED, 42, y - 6, width - 84, 36);
+        pax_col_t color = i == jellyfin_selected ? COLOR_TEXT : COLOR_DIM;
+        if (i < 3) {
+            size_t cap;
+            char *field = jellyfin_field_buffer(i, &cap);
+            (void)cap;
+            char value[120];
+            if (i == 1 && field[0] == '\0') {
+                strlcpy(value, status.has_token ? "<saved>" : "<empty>", sizeof(value));
+            } else if (i == 1 && !(jellyfin_editing && jellyfin_selected == i)) {
+                mask_value(field, value, sizeof(value));
+            } else {
+                strlcpy(value, field[0] != '\0' ? field : "<empty>", sizeof(value));
+            }
+            char line[180];
+            snprintf(line, sizeof(line), "%s: %.118s%s", labels[i], value,
+                     jellyfin_editing && jellyfin_selected == i ? "_" : "");
+            pax_draw_text(buffer, color, pax_font_sky_mono, 18, 58, y, line);
+        } else {
+            pax_draw_text(buffer, color, pax_font_sky_mono, 18, 58, y, labels[i]);
+        }
+    }
+    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, 48, 444,
+                  jellyfin_editing ? "Type text    Enter=Done    Esc=Cancel"
+                                   : "Up/Down select    Enter=Edit/Save    Esc=Back");
 }
 
 static void render_lastfm_account(pax_buf_t *buffer) {
@@ -680,8 +818,15 @@ static void render_lastfm_account(pax_buf_t *buffer) {
             char *field = lastfm_field_buffer(i, &cap);
             (void)cap;
             char value[80];
-            if (i == 1 || i == 3) mask_value(field, value, sizeof(value));
-            else strlcpy(value, field[0] != '\0' ? field : "<empty>", sizeof(value));
+            if (i == 1 && field[0] == '\0') {
+                lastfm_status_t secret_status;
+                lastfm_scrobbler_get_status(&secret_status);
+                strlcpy(value, secret_status.has_api_secret ? "<saved>" : "<empty>", sizeof(value));
+            } else if (i == 3 || (i == 1 && !(lastfm_editing && lastfm_selected == i))) {
+                mask_value(field, value, sizeof(value));
+            } else {
+                strlcpy(value, field[0] != '\0' ? field : "<empty>", sizeof(value));
+            }
             char line[160];
             snprintf(line, sizeof(line), "%s: %.100s%s", labels[i], value,
                      lastfm_editing && lastfm_selected == i ? "_" : "");
@@ -716,6 +861,7 @@ static void render_frame(float dt) {
         case SCREEN_LIBRARY: render_library(buffer); break;
         case SCREEN_NOW_PLAYING: render_now_playing(buffer, dt); break;
         case SCREEN_SETTINGS: render_settings(buffer); break;
+        case SCREEN_JELLYFIN_ACCOUNT: render_jellyfin_account(buffer); break;
         case SCREEN_LASTFM_ACCOUNT: render_lastfm_account(buffer); break;
         case SCREEN_ERROR: render_error(buffer); break;
     }
@@ -752,7 +898,15 @@ static esp_err_t reload_library(void) {
     media_library_clear(&library);
     media_library_unmount();
     esp_err_t err = media_library_mount();
-    if (err == ESP_OK) err = media_library_scan(&library);
+    if (err == ESP_OK) {
+        err = media_library_scan(&library);
+    } else if (jellyfin_client_configured()) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK && jellyfin_client_configured()) {
+        err = jellyfin_client_append_tracks(&library);
+        if (err == ESP_OK && library.count > 1) err = media_library_rebuild_indexes(&library);
+    }
     if (err != ESP_OK) {
         snprintf(error_message, sizeof(error_message), "Unable to read the SD card (%s)", esp_err_to_name(err));
         current_screen = SCREEN_ERROR;
@@ -899,7 +1053,13 @@ static void open_lastfm_account(void) {
     render_dirty = true;
 }
 
-static void change_setting(int delta) {
+static void open_jellyfin_account(void) {
+    load_jellyfin_settings_for_edit();
+    current_screen = SCREEN_JELLYFIN_ACCOUNT;
+    render_dirty = true;
+}
+
+static void change_visual_setting(int delta) {
     static const uint16_t seconds[] = {15, 30, 45, 60, 90, 120, 180};
     static const uint16_t beats[] = {8, 16, 32, 64, 96, 128};
     static const uint16_t dim_times[] = {0, 30, 60, 120, 300, 600};
@@ -933,11 +1093,29 @@ static void change_setting(int delta) {
             ESP_LOGI(TAG, "Dim test: %u%%", settings.dim_brightness);
             ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.dim_brightness));
             break;
-        case 13: settings.lastfm_enabled = !settings.lastfm_enabled; break;
-        case 14: open_lastfm_account(); break;
         default: break;
     }
     apply_settings();
+    render_dirty = true;
+}
+
+static void change_setting(int delta) {
+    if (settings_tab == SETTINGS_TAB_VISUALS) {
+        change_visual_setting(delta);
+        return;
+    }
+    if (settings_tab == SETTINGS_TAB_NETWORK) {
+        if (selected_setting == 0 || selected_setting == 1) open_jellyfin_account();
+        else if (selected_setting == 2) reload_library();
+        render_dirty = true;
+        return;
+    }
+    if (selected_setting == 0) {
+        settings.lastfm_enabled = !settings.lastfm_enabled;
+        apply_settings();
+    } else if (selected_setting == 1) {
+        open_lastfm_account();
+    }
     render_dirty = true;
 }
 
@@ -986,16 +1164,56 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
     }
 
     if (current_screen == SCREEN_SETTINGS) {
+        size_t count = settings_item_count();
         if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
-            selected_setting = (selected_setting + SETTINGS_ITEM_COUNT - 1) % SETTINGS_ITEM_COUNT;
+            selected_setting = (selected_setting + count - 1) % count;
         } else if (key == BSP_INPUT_NAVIGATION_KEY_DOWN) {
-            selected_setting = (selected_setting + 1) % SETTINGS_ITEM_COUNT;
+            selected_setting = (selected_setting + 1) % count;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_TAB) {
+            settings_tab = (settings_tab_t)((settings_tab + 1) % SETTINGS_TAB_COUNT);
+            selected_setting = 0;
         } else if (key == BSP_INPUT_NAVIGATION_KEY_LEFT) {
             change_setting(-1);
         } else if (key == BSP_INPUT_NAVIGATION_KEY_RIGHT || key == BSP_INPUT_NAVIGATION_KEY_RETURN || is_space_key(key)) {
             change_setting(1);
         } else if (key == BSP_INPUT_NAVIGATION_KEY_ESC || key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
             close_settings();
+        }
+        render_dirty = true;
+        return;
+    }
+
+    if (current_screen == SCREEN_JELLYFIN_ACCOUNT) {
+        if (key == BSP_INPUT_NAVIGATION_KEY_ESC) {
+            if (jellyfin_editing) jellyfin_editing = false;
+            else current_screen = SCREEN_SETTINGS;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
+            if (!jellyfin_editing) jellyfin_selected = (jellyfin_selected + 3) % 4;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_DOWN || key == BSP_INPUT_NAVIGATION_KEY_TAB) {
+            if (!jellyfin_editing) jellyfin_selected = (jellyfin_selected + 1) % 4;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
+            if (jellyfin_editing) {
+                size_t cap;
+                char *field = jellyfin_field_buffer(jellyfin_selected, &cap);
+                (void)cap;
+                if (field != NULL) {
+                    size_t length = strlen(field);
+                    if (length > 0) field[length - 1] = '\0';
+                }
+            }
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_RETURN) {
+            if (jellyfin_selected < 3) {
+                jellyfin_editing = !jellyfin_editing;
+            } else {
+                esp_err_t res = jellyfin_client_set_config(jellyfin_edit_url, jellyfin_edit_token,
+                                                           jellyfin_edit_user_id);
+                if (res == ESP_OK) {
+                    jellyfin_edit_token[0] = '\0';
+                    reload_library();
+                } else {
+                    ESP_LOGW(TAG, "Jellyfin settings failed: %s", esp_err_to_name(res));
+                }
+            }
         }
         render_dirty = true;
         return;
@@ -1023,9 +1241,15 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
             if (lastfm_selected < 4) {
                 lastfm_editing = !lastfm_editing;
             } else {
-                esp_err_t res = lastfm_scrobbler_set_api_credentials(lastfm_edit_api_key, lastfm_edit_api_secret);
+                lastfm_status_t status;
+                lastfm_scrobbler_get_status(&status);
+                esp_err_t res = ESP_OK;
+                if (lastfm_edit_api_secret[0] != '\0' || !status.has_api_secret) {
+                    res = lastfm_scrobbler_set_api_credentials(lastfm_edit_api_key, lastfm_edit_api_secret);
+                }
                 if (res == ESP_OK) res = lastfm_scrobbler_login(lastfm_edit_username, lastfm_edit_password);
                 if (res != ESP_OK) ESP_LOGW(TAG, "Last.fm settings failed: %s", esp_err_to_name(res));
+                lastfm_edit_api_secret[0] = '\0';
                 lastfm_edit_password[0] = '\0';
             }
         }
@@ -1110,7 +1334,14 @@ static void handle_input(const bsp_input_event_t *event) {
     switch (event->type) {
         case INPUT_EVENT_TYPE_NAVIGATION: handle_navigation(&event->args_navigation); break;
         case INPUT_EVENT_TYPE_KEYBOARD:
-            if (current_screen == SCREEN_LASTFM_ACCOUNT && lastfm_editing) {
+            if (current_screen == SCREEN_JELLYFIN_ACCOUNT && jellyfin_editing) {
+                size_t cap;
+                char *field = jellyfin_field_buffer(jellyfin_selected, &cap);
+                if (field != NULL) {
+                    append_ascii(field, cap, event->args_keyboard.ascii);
+                    render_dirty = true;
+                }
+            } else if (current_screen == SCREEN_LASTFM_ACCOUNT && lastfm_editing) {
                 size_t cap;
                 char *field = lastfm_field_buffer(lastfm_selected, &cap);
                 if (field != NULL) {
@@ -1268,6 +1499,7 @@ void app_main(void) {
     last_effect_change_time = last_input_time;
 
     ESP_ERROR_CHECK(wifi_setup_init());
+    ESP_ERROR_CHECK(jellyfin_client_init());
     ESP_ERROR_CHECK(lastfm_scrobbler_init());
 
     err = audio_player_init();

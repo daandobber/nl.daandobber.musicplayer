@@ -24,4 +24,22 @@ menu "MusicPlayer"
         help
             Optional first-run password. It is only used to request a Last.fm session and is not saved in NVS.
 
+    config MUSICPLAYER_JELLYFIN_URL
+        string "Jellyfin server URL"
+        default ""
+        help
+            Base URL for a Jellyfin server, for example http://192.168.1.20:8096. Leave empty to disable Jellyfin.
+
+    config MUSICPLAYER_JELLYFIN_TOKEN
+        string "Jellyfin API token"
+        default ""
+        help
+            API token from the Jellyfin dashboard. Leave empty to disable Jellyfin.
+
+    config MUSICPLAYER_JELLYFIN_USER_ID
+        string "Jellyfin user id"
+        default ""
+        help
+            Optional Jellyfin user id used for user-scoped library and stream requests.
+
 endmenu

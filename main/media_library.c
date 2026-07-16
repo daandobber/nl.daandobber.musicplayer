@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include "driver/sdmmc_host.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
@@ -426,7 +427,9 @@ static char *find_folder_cover(const char *track_path, uint32_t *cover_size) {
     return NULL;
 }
 
-static esp_err_t append_track(media_library_t *library, const char *path) {
+esp_err_t media_library_add_track(media_library_t *library, const char *path, const char *title,
+                                  const char *artist, const char *album, uint16_t track_number,
+                                  uint16_t disc_number) {
     if (library->count >= MAX_MEDIA_FILES) return ESP_ERR_NO_MEM;
     if (library->count == library->capacity) {
         size_t new_capacity = library->capacity == 0 ? 64 : library->capacity * 2;
@@ -437,6 +440,26 @@ static esp_err_t append_track(media_library_t *library, const char *path) {
         library->capacity = new_capacity;
     }
 
+    media_track_t track = {
+        .path = strdup(path),
+        .title = strdup(title && title[0] ? title : media_library_display_name(path)),
+        .artist = strdup(artist && artist[0] ? artist : "Unknown artist"),
+        .album = strdup(album && album[0] ? album : "Unknown album"),
+        .track_number = track_number,
+        .disc_number = disc_number,
+    };
+    if (!track.path || !track.title || !track.artist || !track.album) {
+        free(track.path);
+        free(track.title);
+        free(track.artist);
+        free(track.album);
+        return ESP_ERR_NO_MEM;
+    }
+    library->tracks[library->count++] = track;
+    return ESP_OK;
+}
+
+static esp_err_t append_track(media_library_t *library, const char *path) {
     parsed_metadata_t metadata = {0};
     metadata_from_path(path, &metadata);
     FILE *file = fopen(path, "rb");
@@ -465,26 +488,12 @@ static esp_err_t append_track(media_library_t *library, const char *path) {
         cover_size = metadata.cover_size;
     }
 
-    media_track_t track = {
-        .path = strdup(path),
-        .title = strdup(metadata.title),
-        .artist = strdup(metadata.artist),
-        .album = strdup(metadata.album),
-        .cover_path = cover_path,
-        .cover_offset = cover_offset,
-        .cover_size = cover_size,
-        .track_number = metadata.track,
-        .disc_number = metadata.disc,
-    };
-    if (!track.path || !track.title || !track.artist || !track.album) {
-        free(track.path);
-        free(track.title);
-        free(track.artist);
-        free(track.album);
-        free(track.cover_path);
-        return ESP_ERR_NO_MEM;
-    }
-    library->tracks[library->count++] = track;
+    ESP_RETURN_ON_ERROR(media_library_add_track(library, path, metadata.title, metadata.artist, metadata.album,
+                                               metadata.track, metadata.disc), TAG, "Track allocation failed");
+    media_track_t *track = &library->tracks[library->count - 1];
+    track->cover_path = cover_path;
+    track->cover_offset = cover_offset;
+    track->cover_size = cover_size;
     return ESP_OK;
 }
 
@@ -526,8 +535,15 @@ static int compare_tracks(const void *left, const void *right) {
     return result;
 }
 
-static esp_err_t build_indexes(media_library_t *library) {
+esp_err_t media_library_rebuild_indexes(media_library_t *library) {
+    free(library->artists);
+    free(library->albums);
+    library->artists = NULL;
+    library->albums = NULL;
+    library->artist_count = 0;
+    library->album_count = 0;
     if (library->count == 0) return ESP_OK;
+    if (library->count > 1) qsort(library->tracks, library->count, sizeof(media_track_t), compare_tracks);
     library->artists = calloc(library->count, sizeof(media_artist_t));
     library->albums = calloc(library->count, sizeof(media_album_t));
     if (!library->artists || !library->albums) return ESP_ERR_NO_MEM;
@@ -592,8 +608,7 @@ esp_err_t media_library_scan(media_library_t *library) {
     if (library == NULL || mounted_card == NULL) return ESP_ERR_INVALID_STATE;
     media_library_clear(library);
     esp_err_t err = scan_directory(library, MOUNT_POINT, 0);
-    if (err == ESP_OK && library->count > 1) qsort(library->tracks, library->count, sizeof(media_track_t), compare_tracks);
-    if (err == ESP_OK) err = build_indexes(library);
+    if (err == ESP_OK) err = media_library_rebuild_indexes(library);
     ESP_LOGI(TAG, "Library: %u tracks, %u artists, %u albums", (unsigned)library->count,
              (unsigned)library->artist_count, (unsigned)library->album_count);
     return err;

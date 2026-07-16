@@ -11,11 +11,15 @@
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "jellyfin_client.h"
+#include "wifi_setup.h"
 
 #define INPUT_CHUNK_SIZE 4096
 #define INITIAL_PCM_SIZE 8192
@@ -96,11 +100,91 @@ static void set_error(const char *message) {
 }
 
 static esp_audio_simple_dec_type_t decoder_type_for_path(const char *path) {
+    if (jellyfin_client_is_path(path)) return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     const char *extension = strrchr(path, '.');
     if (extension && strcasecmp(extension, ".mp3") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     if (extension && strcasecmp(extension, ".wav") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_WAV;
     if (extension && strcasecmp(extension, ".flac") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
     return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
+}
+
+typedef struct {
+    FILE *file;
+    esp_http_client_handle_t http;
+    bool is_http;
+} player_input_t;
+
+static esp_err_t input_open(const char *path, player_input_t *input) {
+    memset(input, 0, sizeof(*input));
+    if (!jellyfin_client_is_path(path)) {
+        input->file = fopen(path, "rb");
+        return input->file ? ESP_OK : ESP_FAIL;
+    }
+
+    if (!wifi_setup_connect_blocking(20000)) return ESP_ERR_TIMEOUT;
+    char url[512];
+    esp_err_t err = jellyfin_client_stream_url(path, url, sizeof(url));
+    if (err != ESP_OK) {
+        wifi_setup_disconnect();
+        return err;
+    }
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 20000,
+        .buffer_size = INPUT_CHUNK_SIZE,
+    };
+    input->http = esp_http_client_init(&config);
+    if (input->http == NULL) {
+        wifi_setup_disconnect();
+        return ESP_FAIL;
+    }
+    esp_http_client_set_header(input->http, "Accept", "audio/mpeg,audio/*");
+    esp_http_client_set_header(input->http, "X-Emby-Token", jellyfin_client_token());
+    err = esp_http_client_open(input->http, 0);
+    if (err == ESP_OK) {
+        int content_length = esp_http_client_fetch_headers(input->http);
+        int status = esp_http_client_get_status_code(input->http);
+        if (status < 200 || status >= 300) err = ESP_FAIL;
+        ESP_LOGI(TAG, "Jellyfin stream HTTP %d, %d bytes", status, content_length);
+    }
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(input->http);
+        input->http = NULL;
+        wifi_setup_disconnect();
+        return err;
+    }
+    input->is_http = true;
+    return ESP_OK;
+}
+
+static size_t input_read(player_input_t *input, uint8_t *buffer, size_t size, bool *failed) {
+    *failed = false;
+    if (!input->is_http) {
+        size_t read = fread(buffer, 1, size, input->file);
+        if (read == 0 && ferror(input->file)) *failed = true;
+        return read;
+    }
+    int read = esp_http_client_read(input->http, (char *)buffer, (int)size);
+    if (read < 0) {
+        *failed = true;
+        return 0;
+    }
+    return (size_t)read;
+}
+
+static bool input_eof(player_input_t *input) {
+    return input->is_http ? esp_http_client_is_complete_data_received(input->http) : feof(input->file);
+}
+
+static void input_close(player_input_t *input) {
+    if (input->file) fclose(input->file);
+    if (input->http) {
+        esp_http_client_close(input->http);
+        esp_http_client_cleanup(input->http);
+        wifi_setup_disconnect();
+    }
 }
 
 static control_result_t handle_commands(bool wait, bool *paused, char *replacement) {
@@ -233,8 +317,8 @@ static esp_err_t output_pcm(const uint8_t *data, size_t bytes, const esp_audio_s
 }
 
 static control_result_t decode_file(const char *path, char *replacement) {
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
+    player_input_t source;
+    if (input_open(path, &source) != ESP_OK) {
         set_error("Unable to open the audio file");
         return CONTROL_STOP;
     }
@@ -250,7 +334,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
     esp_audio_simple_dec_handle_t decoder = NULL;
     esp_audio_err_t audio_err = esp_audio_simple_dec_open(&config, &decoder);
     if (audio_err != ESP_AUDIO_ERR_OK) {
-        fclose(file);
+        input_close(&source);
         set_error("The decoder cannot open this file");
         return CONTROL_STOP;
     }
@@ -264,7 +348,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
         free(input);
         free(pcm);
         esp_audio_simple_dec_close(decoder);
-        fclose(file);
+        input_close(&source);
         set_error("Onvoldoende geheugen voor decoder");
         return CONTROL_STOP;
     }
@@ -284,10 +368,11 @@ static control_result_t decode_file(const char *path, char *replacement) {
         result = wait_while_paused(&paused, replacement);
         if (result != CONTROL_CONTINUE) break;
 
-        size_t read = fread(input, 1, INPUT_CHUNK_SIZE, file);
+        bool read_failed = false;
+        size_t read = input_read(&source, input, INPUT_CHUNK_SIZE, &read_failed);
         if (read == 0) {
-            if (ferror(file)) {
-                set_error("SD card read error");
+            if (read_failed) {
+                set_error(source.is_http ? "Network stream read error" : "SD card read error");
                 failed = true;
             }
             break;
@@ -296,7 +381,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
         esp_audio_simple_dec_raw_t raw = {
             .buffer = input,
             .len = read,
-            .eos = feof(file),
+            .eos = input_eof(&source),
         };
 
         while (raw.len > 0) {
@@ -378,7 +463,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
     free(pcm);
     free(input);
     esp_audio_simple_dec_close(decoder);
-    fclose(file);
+    input_close(&source);
 
     if (result == CONTROL_REPLACE) return result;
     if (!failed && result != CONTROL_STOP) {

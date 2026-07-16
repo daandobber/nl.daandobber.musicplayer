@@ -392,7 +392,6 @@ void lastfm_scrobbler_get_config(lastfm_config_t *out) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(out, 0, sizeof(*out));
     snprintf(out->api_key, sizeof(out->api_key), "%s", s_api_key);
-    snprintf(out->api_secret, sizeof(out->api_secret), "%s", s_api_secret);
     snprintf(out->username, sizeof(out->username), "%s", s_username);
     xSemaphoreGive(s_mutex);
 }

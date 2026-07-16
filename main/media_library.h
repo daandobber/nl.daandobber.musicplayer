@@ -43,6 +43,10 @@ typedef struct {
 esp_err_t media_library_mount(void);
 void      media_library_unmount(void);
 esp_err_t media_library_scan(media_library_t *library);
+esp_err_t media_library_add_track(media_library_t *library, const char *path, const char *title,
+                                  const char *artist, const char *album, uint16_t track_number,
+                                  uint16_t disc_number);
+esp_err_t media_library_rebuild_indexes(media_library_t *library);
 void      media_library_clear(media_library_t *library);
 size_t    media_library_find_path(const media_library_t *library, const char *path);
 const char *media_library_display_name(const char *path);

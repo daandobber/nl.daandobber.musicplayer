@@ -10,6 +10,7 @@ idf_component_register(
 		"audio_analysis.c"
 		"audio_player.c"
 		"effects.c"
+		"jellyfin_client.c"
 		"lastfm_scrobbler.c"
 		"main.c"
 		"media_library.c"
@@ -31,12 +32,15 @@ idf_component_register(
 		json
 		mbedtls
 		nvs_flash
+		pax-gfx
 		sdmmc
 		tanmatsu-wifi
 		${extra_requires}
 	INCLUDE_DIRS
 		"."
 )
+
+idf_component_set_property(robotman2412__pax-gfx WHOLE_ARCHIVE TRUE)
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-variable" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-const-variable" APPEND)
