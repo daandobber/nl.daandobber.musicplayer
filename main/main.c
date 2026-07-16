@@ -211,11 +211,9 @@ static void load_lastfm_settings_for_edit(void) {
 }
 
 static void load_jellyfin_settings_for_edit(void) {
-    jellyfin_config_t config;
-    jellyfin_client_get_config(&config);
-    strlcpy(jellyfin_edit_url, config.url, sizeof(jellyfin_edit_url));
+    jellyfin_edit_url[0] = '\0';
     jellyfin_edit_token[0] = '\0';
-    strlcpy(jellyfin_edit_user_id, config.user_id, sizeof(jellyfin_edit_user_id));
+    jellyfin_edit_user_id[0] = '\0';
     jellyfin_selected = 0;
     jellyfin_editing = false;
 }
@@ -695,11 +693,9 @@ static void setting_value(size_t index, char *value, size_t value_size) {
         return;
     }
     if (settings_tab == SETTINGS_TAB_NETWORK) {
-        if (index == 0) {
-            strlcpy(value, jellyfin_client_configured() ? "Configured" : "Off", value_size);
-        } else {
-            strlcpy(value, "Press Right", value_size);
-        }
+        if (index == 0) strlcpy(value, "Coming soon", value_size);
+        else if (index == 1) strlcpy(value, "Unavailable", value_size);
+        else strlcpy(value, "SD only", value_size);
         return;
     }
     switch (index) {
@@ -752,44 +748,14 @@ static void render_jellyfin_account(pax_buf_t *buffer) {
     int width = pax_buf_get_width(buffer);
     pax_background(buffer, COLOR_BG);
     draw_header(buffer, "MUSICPLAYER // NETWORK", "Esc");
-
-    jellyfin_config_t status;
-    jellyfin_client_get_config(&status);
-    char status_line[160];
-    snprintf(status_line, sizeof(status_line), "%s%s%.72s",
-             jellyfin_client_configured() ? "Jellyfin configured" : "Jellyfin not configured",
-             status.url[0] ? " - " : "", status.url);
-    pax_draw_text(buffer, jellyfin_client_configured() ? COLOR_ACCENT : COLOR_DIM,
-                  pax_font_sky_mono, 18, 58, 76, status_line);
-
-    static const char *labels[] = {"Server URL", "API token", "User ID", "Save + reload"};
-    for (size_t i = 0; i < 4; i++) {
-        int y = 140 + (int)i * 39;
-        if (i == jellyfin_selected) pax_simple_rect(buffer, COLOR_SELECTED, 42, y - 6, width - 84, 36);
-        pax_col_t color = i == jellyfin_selected ? COLOR_TEXT : COLOR_DIM;
-        if (i < 3) {
-            size_t cap;
-            char *field = jellyfin_field_buffer(i, &cap);
-            (void)cap;
-            char value[120];
-            if (i == 1 && field[0] == '\0') {
-                strlcpy(value, status.has_token ? "<saved>" : "<empty>", sizeof(value));
-            } else if (i == 1 && !(jellyfin_editing && jellyfin_selected == i)) {
-                mask_value(field, value, sizeof(value));
-            } else {
-                strlcpy(value, field[0] != '\0' ? field : "<empty>", sizeof(value));
-            }
-            char line[180];
-            snprintf(line, sizeof(line), "%s: %.118s%s", labels[i], value,
-                     jellyfin_editing && jellyfin_selected == i ? "_" : "");
-            pax_draw_text(buffer, color, pax_font_sky_mono, 18, 58, y, line);
-        } else {
-            pax_draw_text(buffer, color, pax_font_sky_mono, 18, 58, y, labels[i]);
-        }
-    }
+    pax_draw_text(buffer, COLOR_ACCENT, pax_font_sky_mono, 27, 58, 126, "Coming soon");
+    pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 18, 58, 178,
+                  "Network drives are disabled in this beta.");
+    pax_simple_rect(buffer, COLOR_SELECTED, 42, 238, width - 84, 44);
+    pax_draw_text(buffer, COLOR_TEXT, pax_font_sky_mono, 18, 58, 250,
+                  "Jellyfin support will return after the protocol is stable.");
     pax_draw_text(buffer, COLOR_DIM, pax_font_sky_mono, 9, 48, 444,
-                  jellyfin_editing ? "Type text    Enter=Done    Esc=Cancel"
-                                   : "Up/Down select    Enter=Edit/Save    Esc=Back");
+                  "Esc=Back");
 }
 
 static void render_lastfm_account(pax_buf_t *buffer) {
@@ -900,12 +866,6 @@ static esp_err_t reload_library(void) {
     esp_err_t err = media_library_mount();
     if (err == ESP_OK) {
         err = media_library_scan(&library);
-    } else if (jellyfin_client_configured()) {
-        err = ESP_OK;
-    }
-    if (err == ESP_OK && jellyfin_client_configured()) {
-        err = jellyfin_client_append_tracks(&library);
-        if (err == ESP_OK && library.count > 1) err = media_library_rebuild_indexes(&library);
     }
     if (err != ESP_OK) {
         snprintf(error_message, sizeof(error_message), "Unable to read the SD card (%s)", esp_err_to_name(err));
@@ -1185,35 +1145,7 @@ static void handle_navigation(const bsp_input_event_args_navigation_t *navigatio
 
     if (current_screen == SCREEN_JELLYFIN_ACCOUNT) {
         if (key == BSP_INPUT_NAVIGATION_KEY_ESC) {
-            if (jellyfin_editing) jellyfin_editing = false;
-            else current_screen = SCREEN_SETTINGS;
-        } else if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
-            if (!jellyfin_editing) jellyfin_selected = (jellyfin_selected + 3) % 4;
-        } else if (key == BSP_INPUT_NAVIGATION_KEY_DOWN || key == BSP_INPUT_NAVIGATION_KEY_TAB) {
-            if (!jellyfin_editing) jellyfin_selected = (jellyfin_selected + 1) % 4;
-        } else if (key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
-            if (jellyfin_editing) {
-                size_t cap;
-                char *field = jellyfin_field_buffer(jellyfin_selected, &cap);
-                (void)cap;
-                if (field != NULL) {
-                    size_t length = strlen(field);
-                    if (length > 0) field[length - 1] = '\0';
-                }
-            }
-        } else if (key == BSP_INPUT_NAVIGATION_KEY_RETURN) {
-            if (jellyfin_selected < 3) {
-                jellyfin_editing = !jellyfin_editing;
-            } else {
-                esp_err_t res = jellyfin_client_set_config(jellyfin_edit_url, jellyfin_edit_token,
-                                                           jellyfin_edit_user_id);
-                if (res == ESP_OK) {
-                    jellyfin_edit_token[0] = '\0';
-                    reload_library();
-                } else {
-                    ESP_LOGW(TAG, "Jellyfin settings failed: %s", esp_err_to_name(res));
-                }
-            }
+            current_screen = SCREEN_SETTINGS;
         }
         render_dirty = true;
         return;
@@ -1334,14 +1266,7 @@ static void handle_input(const bsp_input_event_t *event) {
     switch (event->type) {
         case INPUT_EVENT_TYPE_NAVIGATION: handle_navigation(&event->args_navigation); break;
         case INPUT_EVENT_TYPE_KEYBOARD:
-            if (current_screen == SCREEN_JELLYFIN_ACCOUNT && jellyfin_editing) {
-                size_t cap;
-                char *field = jellyfin_field_buffer(jellyfin_selected, &cap);
-                if (field != NULL) {
-                    append_ascii(field, cap, event->args_keyboard.ascii);
-                    render_dirty = true;
-                }
-            } else if (current_screen == SCREEN_LASTFM_ACCOUNT && lastfm_editing) {
+            if (current_screen == SCREEN_LASTFM_ACCOUNT && lastfm_editing) {
                 size_t cap;
                 char *field = lastfm_field_buffer(lastfm_selected, &cap);
                 if (field != NULL) {
