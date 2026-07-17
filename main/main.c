@@ -39,10 +39,10 @@
 #define NOW_CARD_Y      350
 #define NOW_CARD_W      376
 #define NOW_CARD_H      114
-#define SPLASH_W        160
-#define SPLASH_H        160
-#define SPLASH_FPS      15
-#define SPLASH_FRAMES   30
+#define SPLASH_W        72
+#define SPLASH_H        72
+#define SPLASH_FRAMES   15
+#define SPLASH_DURATION_US 2000000
 
 static const char *TAG = "musicplayer";
 
@@ -1514,7 +1514,7 @@ static void run_splash_until_ready(void) {
         }
         int64_t now = esp_timer_get_time();
         int64_t elapsed = now - start;
-        size_t frame = (size_t)((elapsed * SPLASH_FPS) / 1000000);
+        size_t frame = (size_t)((elapsed * SPLASH_FRAMES) / SPLASH_DURATION_US);
         if (frame >= SPLASH_FRAMES) {
             frame = SPLASH_FRAMES - 1;
             splash_finished = true;
