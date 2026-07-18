@@ -83,6 +83,7 @@ static void set_error(const char *fmt, ...) {
     vsnprintf(s_last_error, sizeof(s_last_error), fmt, args);
     xSemaphoreGive(s_mutex);
     va_end(args);
+    ESP_LOGE(TAG, "%s", s_last_error);
     s_dirty = true;
 }
 
@@ -228,23 +229,34 @@ static void sign_auth(const lastfm_request_t *req, char out[33]) {
     md5_hex(sig_src, out);
 }
 
+static size_t append_sig_pair(char *out, size_t cap, size_t pos, const char *key, const char *value) {
+    int written = snprintf(out + pos, cap - pos, "%s%s", key, value ? value : "");
+    return written < 0 || (size_t)written >= cap - pos ? cap : pos + (size_t)written;
+}
+
+static size_t append_sig_u32(char *out, size_t cap, size_t pos, const char *key, uint32_t value) {
+    char text[16];
+    snprintf(text, sizeof(text), "%u", (unsigned)value);
+    return append_sig_pair(out, cap, pos, key, text);
+}
+
 static void sign_track(const lastfm_request_t *req, char out[33]) {
-    char sig_src[768];
+    char sig_src[768] = "";
+    size_t pos = 0;
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "album", req->album);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "api_key", req->api_key);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "artist", req->artist);
+    if (req->duration_sec > 0) pos = append_sig_u32(sig_src, sizeof(sig_src), pos, "duration", req->duration_sec);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "method", req->method);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "sk", req->session_key);
     if (strcmp(req->method, "track.scrobble") == 0) {
-        snprintf(
-            sig_src, sizeof(sig_src),
-            "album%sapi_key%sartist%sduration%umethodtrack.scrobblesk%stimestamp%utrack%strackNumber%d%s",
-            req->album, req->api_key, req->artist, (unsigned)req->duration_sec, req->session_key,
-            (unsigned)req->timestamp, req->track, req->track_number, req->api_secret
-        );
-    } else {
-        snprintf(
-            sig_src, sizeof(sig_src),
-            "album%sapi_key%sartist%sduration%umethodtrack.updateNowPlayingsk%strack%strackNumber%d%s",
-            req->album, req->api_key, req->artist, (unsigned)req->duration_sec, req->session_key, req->track,
-            req->track_number, req->api_secret
-        );
+        pos = append_sig_u32(sig_src, sizeof(sig_src), pos, "timestamp", req->timestamp);
     }
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "track", req->track);
+    if (req->track_number > 0) {
+        pos = append_sig_u32(sig_src, sizeof(sig_src), pos, "trackNumber", (uint32_t)req->track_number);
+    }
+    append_sig_pair(sig_src, sizeof(sig_src), pos, "", req->api_secret);
     md5_hex(sig_src, out);
 }
 
@@ -268,11 +280,13 @@ static bool ensure_time_valid(void) {
     return false;
 }
 
-static void handle_track_response(const lastfm_request_t *req, const uint8_t *buf, size_t len) {
-    if (strcmp(req->method, "track.updateNowPlaying") == 0) {
-        return;
-    }
+static int json_integer(cJSON *value, int fallback) {
+    if (cJSON_IsNumber(value)) return value->valueint;
+    if (cJSON_IsString(value) && value->valuestring) return atoi(value->valuestring);
+    return fallback;
+}
 
+static void handle_track_response(const lastfm_request_t *req, const uint8_t *buf, size_t len) {
     cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
     cJSON *api_error = root ? cJSON_GetObjectItem(root, "error") : NULL;
     cJSON *api_message = root ? cJSON_GetObjectItem(root, "message") : NULL;
@@ -284,6 +298,17 @@ static void handle_track_response(const lastfm_request_t *req, const uint8_t *bu
         return;
     }
 
+    if (strcmp(req->method, "track.updateNowPlaying") == 0) {
+        if (root) {
+            clear_error();
+            ESP_LOGI(TAG, "Now playing accepted: %s - %s", req->artist, req->track);
+        } else {
+            set_error("now playing response");
+        }
+        if (root) cJSON_Delete(root);
+        return;
+    }
+
     cJSON *scrobbles = root ? cJSON_GetObjectItem(root, "scrobbles") : NULL;
     cJSON *scrobble = scrobbles ? cJSON_GetObjectItem(scrobbles, "scrobble") : NULL;
     cJSON *ignored = scrobble ? cJSON_GetObjectItem(scrobble, "ignoredMessage") : NULL;
@@ -291,15 +316,18 @@ static void handle_track_response(const lastfm_request_t *req, const uint8_t *bu
     cJSON *ignored_text_value = cJSON_IsObject(ignored) ? cJSON_GetObjectItem(ignored, "#text") : NULL;
     const char *ignored_text = cJSON_IsString(ignored) ? ignored->valuestring :
                                (cJSON_IsString(ignored_text_value) ? ignored_text_value->valuestring : "");
-    int code = cJSON_IsNumber(ignored_code) ? ignored_code->valueint : 0;
+    int code = json_integer(ignored_code, 0);
+    cJSON *attributes = scrobbles ? cJSON_GetObjectItem(scrobbles, "@attr") : NULL;
+    int accepted = json_integer(attributes ? cJSON_GetObjectItem(attributes, "accepted") : NULL, -1);
+    int ignored_count = json_integer(attributes ? cJSON_GetObjectItem(attributes, "ignored") : NULL, 0);
     if ((ignored_text != NULL && ignored_text[0] != '\0') || code != 0) {
         set_error("scrobble ignored %d %.56s", code, ignored_text);
         s_scrobbled_current = false;
-    } else if (scrobble != NULL) {
+    } else if (scrobble != NULL && accepted != 0 && ignored_count == 0) {
         clear_error();
         ESP_LOGI(TAG, "Scrobble accepted: %s - %s", req->artist, req->track);
     } else {
-        set_error("scrobble response");
+        set_error("scrobble rejected accepted=%d ignored=%d", accepted, ignored_count);
         s_scrobbled_current = false;
     }
     if (root) cJSON_Delete(root);
@@ -337,6 +365,7 @@ static void request_task(void *arg) {
         return;
     }
 
+    ESP_LOGI(TAG, "Sending %s: %s - %s", req->method, req->artist, req->track);
     if (!wifi_setup_connect_blocking(15000)) {
         set_error("no wifi");
         goto done;
@@ -371,8 +400,10 @@ static void request_task(void *arg) {
         pos = append_pair(body, sizeof(body), pos, "artist", req->artist);
         pos = append_pair(body, sizeof(body), pos, "track", req->track);
         pos = append_pair(body, sizeof(body), pos, "album", req->album);
-        pos = append_pair_u32(body, sizeof(body), pos, "duration", req->duration_sec);
-        pos = append_pair_u32(body, sizeof(body), pos, "trackNumber", (uint32_t)req->track_number);
+        if (req->duration_sec > 0) pos = append_pair_u32(body, sizeof(body), pos, "duration", req->duration_sec);
+        if (req->track_number > 0) {
+            pos = append_pair_u32(body, sizeof(body), pos, "trackNumber", (uint32_t)req->track_number);
+        }
         if (strcmp(req->method, "track.scrobble") == 0) {
             pos = append_pair_u32(body, sizeof(body), pos, "timestamp", req->timestamp);
         }
@@ -389,6 +420,7 @@ static void request_task(void *arg) {
     size_t len = 0;
     int status = 0;
     esp_err_t res = http_post_form(body, buf, LASTFM_HTTP_CAP, &len, &status);
+    ESP_LOGI(TAG, "%s HTTP %d, %u bytes", req->method, status, (unsigned)len);
     if (res != ESP_OK || status != 200) {
         set_error("http %s/%d", esp_err_to_name(res), status);
         goto done_wifi;
@@ -512,7 +544,10 @@ void lastfm_scrobbler_now_playing(const lastfm_track_info_t *track) {
         free(req);
         return;
     }
-    xTaskCreate(request_task, "lastfm_now", 12288, req, 3, NULL);
+    if (xTaskCreate(request_task, "lastfm_now", 12288, req, 3, NULL) != pdPASS) {
+        free(req);
+        set_error("now playing task");
+    }
 }
 
 void lastfm_scrobbler_maybe_scrobble(const lastfm_track_info_t *track, uint32_t elapsed_sec) {
@@ -530,7 +565,11 @@ void lastfm_scrobbler_maybe_scrobble(const lastfm_track_info_t *track, uint32_t 
     }
     req->elapsed_sec = elapsed_sec;
     s_scrobbled_current = true;
-    xTaskCreate(request_task, "lastfm_scrob", 12288, req, 3, NULL);
+    if (xTaskCreate(request_task, "lastfm_scrob", 12288, req, 3, NULL) != pdPASS) {
+        s_scrobbled_current = false;
+        free(req);
+        set_error("scrobble task");
+    }
 }
 
 void lastfm_scrobbler_track_changed(void) {

@@ -36,7 +36,7 @@ static bool is_media_file(const char *name) {
     const char *extension = strrchr(name, '.');
     return extension != NULL &&
            (strcasecmp(extension, ".mp3") == 0 || strcasecmp(extension, ".wav") == 0 ||
-            strcasecmp(extension, ".flac") == 0);
+            strcasecmp(extension, ".flac") == 0 || strcasecmp(extension, ".ogg") == 0);
 }
 
 static void trim(char *text) {
@@ -459,6 +459,60 @@ esp_err_t media_library_add_track(media_library_t *library, const char *path, co
     return ESP_OK;
 }
 
+/* Reassemble Ogg packets because a Vorbis comment packet may cross page boundaries. */
+static void parse_ogg(FILE *file, parsed_metadata_t *metadata) {
+    uint8_t *packet = malloc(65536);
+    if (!packet) return;
+    size_t packet_size = 0;
+    rewind(file);
+    for (unsigned pages = 0; pages < 64; pages++) {
+        uint8_t header[27];
+        if (fread(header, 1, sizeof(header), file) != sizeof(header) || memcmp(header, "OggS", 4) != 0) break;
+        uint8_t segments = header[26];
+        uint8_t lacing[255];
+        if (fread(lacing, 1, segments, file) != segments) break;
+        for (uint8_t segment = 0; segment < segments; segment++) {
+            size_t length = lacing[segment];
+            if (packet_size + length > 65536 || fread(packet + packet_size, 1, length, file) != length) {
+                free(packet);
+                return;
+            }
+            packet_size += length;
+            if (length < 255) {
+                if (packet_size >= 11 && packet[0] == 3 && memcmp(packet + 1, "vorbis", 6) == 0) {
+                    size_t pos = 7;
+                    uint32_t vendor_length = read_le32(packet + pos);
+                    pos += 4;
+                    if (vendor_length <= packet_size - pos) pos += vendor_length;
+                    else { free(packet); return; }
+                    if (packet_size - pos < 4) { free(packet); return; }
+                    uint32_t count = read_le32(packet + pos);
+                    pos += 4;
+                    for (uint32_t i = 0; i < count && packet_size - pos >= 4; i++) {
+                        uint32_t comment_length = read_le32(packet + pos);
+                        pos += 4;
+                        if (comment_length > packet_size - pos) break;
+                        uint8_t *equals = memchr(packet + pos, '=', comment_length);
+                        if (equals) {
+                            char field[32];
+                            size_t field_length = (size_t)(equals - (packet + pos));
+                            if (field_length >= sizeof(field)) field_length = sizeof(field) - 1;
+                            memcpy(field, packet + pos, field_length);
+                            field[field_length] = '\0';
+                            apply_vorbis_comment(field, equals + 1, comment_length - field_length - 1, metadata);
+                        }
+                        pos += comment_length;
+                    }
+                    free(packet);
+                    return;
+                }
+                packet_size = 0;
+            }
+        }
+    }
+    free(packet);
+}
+
 static esp_err_t append_track(media_library_t *library, const char *path) {
     parsed_metadata_t metadata = {0};
     metadata_from_path(path, &metadata);
@@ -470,6 +524,8 @@ static esp_err_t append_track(media_library_t *library, const char *path) {
             parse_id3v2(file, &metadata);
         } else if (extension && strcasecmp(extension, ".flac") == 0) {
             parse_flac(file, &metadata);
+        } else if (extension && strcasecmp(extension, ".ogg") == 0) {
+            parse_ogg(file, &metadata);
         } else {
             parse_wav_info(file, &metadata);
         }

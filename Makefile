@@ -115,6 +115,7 @@ clean:
 
 .PHONY: fullclean
 fullclean: clean
+	rm -f "$(SDKCONFIG)" "$(SDKCONFIG).old"
 	rm -f sdkconfig
 	rm -f sdkconfig.old
 	rm -f sdkconfig.ci

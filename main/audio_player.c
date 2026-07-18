@@ -24,6 +24,9 @@
 #define INPUT_CHUNK_SIZE 4096
 #define INITIAL_PCM_SIZE 8192
 #define I2S_WRITE_SAMPLES 1024
+#define FLAC_STREAMINFO_SIZE 34
+#define FLAC_PREFIX_SIZE (4 + 4 + FLAC_STREAMINFO_SIZE)
+#define FLAC_MAX_METADATA_BLOCKS 128
 
 static const char *TAG = "player";
 
@@ -105,6 +108,7 @@ static esp_audio_simple_dec_type_t decoder_type_for_path(const char *path) {
     if (extension && strcasecmp(extension, ".mp3") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     if (extension && strcasecmp(extension, ".wav") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_WAV;
     if (extension && strcasecmp(extension, ".flac") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
+    if (extension && strcasecmp(extension, ".ogg") == 0) return ESP_AUDIO_SIMPLE_DEC_TYPE_OGG;
     return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
 }
 
@@ -112,13 +116,89 @@ typedef struct {
     FILE *file;
     esp_http_client_handle_t http;
     bool is_http;
+    long file_size;
+    uint8_t flac_prefix[FLAC_PREFIX_SIZE];
+    size_t flac_prefix_length;
+    size_t flac_prefix_offset;
 } player_input_t;
+
+static bool prepare_flac_input(player_input_t *input) {
+    uint8_t marker[4];
+    uint8_t block_header[4];
+    rewind(input->file);
+    if (fread(marker, 1, sizeof(marker), input->file) != sizeof(marker) || memcmp(marker, "fLaC", 4) != 0 ||
+        fread(block_header, 1, sizeof(block_header), input->file) != sizeof(block_header)) {
+        rewind(input->file);
+        return false;
+    }
+
+    uint8_t block_type = block_header[0] & 0x7f;
+    uint32_t block_size = ((uint32_t)block_header[1] << 16) | ((uint32_t)block_header[2] << 8) | block_header[3];
+    if (block_type != 0 || block_size != FLAC_STREAMINFO_SIZE) {
+        rewind(input->file);
+        return false;
+    }
+
+    memcpy(input->flac_prefix, marker, sizeof(marker));
+    memcpy(input->flac_prefix + sizeof(marker), block_header, sizeof(block_header));
+    if (fread(input->flac_prefix + 8, 1, FLAC_STREAMINFO_SIZE, input->file) != FLAC_STREAMINFO_SIZE) {
+        rewind(input->file);
+        return false;
+    }
+
+    bool last_block = (block_header[0] & 0x80) != 0;
+    for (size_t blocks = 1; !last_block && blocks < FLAC_MAX_METADATA_BLOCKS; blocks++) {
+        if (fread(block_header, 1, sizeof(block_header), input->file) != sizeof(block_header)) {
+            rewind(input->file);
+            return false;
+        }
+        last_block = (block_header[0] & 0x80) != 0;
+        block_size = ((uint32_t)block_header[1] << 16) | ((uint32_t)block_header[2] << 8) | block_header[3];
+        long block_start = ftell(input->file);
+        if (block_start < 0 ||
+            (input->file_size >= 0 && (block_start > input->file_size ||
+                                      (long)block_size > input->file_size - block_start)) ||
+            fseek(input->file, (long)block_size, SEEK_CUR) != 0) {
+            rewind(input->file);
+            return false;
+        }
+    }
+    if (!last_block) {
+        rewind(input->file);
+        return false;
+    }
+
+    long audio_offset = ftell(input->file);
+    if (audio_offset < 0 || (input->file_size >= 0 && audio_offset >= input->file_size)) {
+        rewind(input->file);
+        return false;
+    }
+
+    // The Espressif FLAC elementary-stream parser searches at most 512 kB
+    // after STREAMINFO for its first audio frame. Present a valid minimal
+    // FLAC header followed directly by audio frames, omitting comments,
+    // pictures, padding and seek tables that the decoder does not need.
+    input->flac_prefix[4] = 0x80;  // STREAMINFO is now the last metadata block.
+    input->flac_prefix_length = FLAC_PREFIX_SIZE;
+    input->flac_prefix_offset = 0;
+    if (audio_offset > FLAC_PREFIX_SIZE) {
+        ESP_LOGI(TAG, "FLAC: skipped %ld bytes of non-audio metadata", audio_offset - FLAC_PREFIX_SIZE);
+    }
+    return true;
+}
 
 static esp_err_t input_open(const char *path, player_input_t *input) {
     memset(input, 0, sizeof(*input));
+    input->file_size = -1;
     if (!jellyfin_client_is_path(path)) {
         input->file = fopen(path, "rb");
-        return input->file ? ESP_OK : ESP_FAIL;
+        if (input->file == NULL) return ESP_FAIL;
+        if (fseek(input->file, 0, SEEK_END) == 0) {
+            input->file_size = ftell(input->file);
+            rewind(input->file);
+        }
+        if (decoder_type_for_path(path) == ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC) prepare_flac_input(input);
+        return ESP_OK;
     }
 
     if (!wifi_setup_connect_blocking(20000)) return ESP_ERR_TIMEOUT;
@@ -162,9 +242,17 @@ static esp_err_t input_open(const char *path, player_input_t *input) {
 static size_t input_read(player_input_t *input, uint8_t *buffer, size_t size, bool *failed) {
     *failed = false;
     if (!input->is_http) {
-        size_t read = fread(buffer, 1, size, input->file);
-        if (read == 0 && ferror(input->file)) *failed = true;
-        return read;
+        size_t total = 0;
+        if (input->flac_prefix_offset < input->flac_prefix_length) {
+            size_t remaining = input->flac_prefix_length - input->flac_prefix_offset;
+            size_t take = remaining < size ? remaining : size;
+            memcpy(buffer, input->flac_prefix + input->flac_prefix_offset, take);
+            input->flac_prefix_offset += take;
+            total += take;
+        }
+        if (total < size) total += fread(buffer + total, 1, size - total, input->file);
+        if (ferror(input->file)) *failed = true;
+        return total;
     }
     int read = esp_http_client_read(input->http, (char *)buffer, (int)size);
     if (read < 0) {
@@ -175,7 +263,13 @@ static size_t input_read(player_input_t *input, uint8_t *buffer, size_t size, bo
 }
 
 static bool input_eof(player_input_t *input) {
-    return input->is_http ? esp_http_client_is_complete_data_received(input->http) : feof(input->file);
+    if (input->is_http) return esp_http_client_is_complete_data_received(input->http);
+    if (input->flac_prefix_offset < input->flac_prefix_length) return false;
+    if (input->file_size >= 0) {
+        long position = ftell(input->file);
+        if (position >= 0) return position >= input->file_size;
+    }
+    return feof(input->file);
 }
 
 static void input_close(player_input_t *input) {
@@ -403,7 +497,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
                 continue;
             }
             if (audio_err != ESP_AUDIO_ERR_OK) {
-                set_error("Ongeldige of beschadigde MP3/WAV-data");
+                set_error("Ongeldige of beschadigde audiogegevens");
                 failed = true;
                 break;
             }
@@ -443,15 +537,20 @@ static control_result_t decode_file(const char *path, char *replacement) {
                 }
             }
 
-            if (raw.consumed == 0) {
-                if (output.decoded_size == 0) {
-                    set_error("Decoder made no progress");
-                    failed = true;
-                }
+            // A simple decoder may first return a frame that was assembled
+            // from its internal cache without consuming the newly supplied
+            // input. Keep offering that same input until it is consumed;
+            // overwriting it with the next SD-card chunk corrupts frame sync,
+            // especially for FLAC frames larger than INPUT_CHUNK_SIZE.
+            if (raw.consumed == 0 && output.decoded_size == 0) {
+                set_error("Decoder made no progress");
+                failed = true;
                 break;
             }
-            raw.buffer += raw.consumed;
-            raw.len -= raw.consumed;
+            if (raw.consumed > 0) {
+                raw.buffer += raw.consumed;
+                raw.len -= raw.consumed;
+            }
 
             result = handle_commands(false, &paused, replacement);
             if (result != CONTROL_CONTINUE) break;

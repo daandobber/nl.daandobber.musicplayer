@@ -11,9 +11,9 @@ the ESP32-P4.
 
 ## Features
 
-- Recursively finds MP3, WAV, and FLAC files on the microSD card.
-- MP3, 8/16/24/32-bit mono/stereo WAV, and FLAC playback through the ES8156 codec.
-- Artist/album library with ID3v1/ID3v2, WAV `LIST/INFO`, and FLAC Vorbis comment metadata, plus filename/folder fallbacks.
+- Recursively finds MP3, WAV, FLAC, and OGG files on the microSD card.
+- MP3, 8/16/24/32-bit mono/stereo WAV, FLAC, and OGG playback through the ES8156 codec.
+- Artist/album library with ID3v1/ID3v2, WAV `LIST/INFO`, FLAC and Ogg Vorbis comment metadata, plus filename/folder fallbacks.
 - Editable play queue: replace it with an artist or album, append selections, and remove tracks.
 - Hardware volume control and speaker/headphone handling through the Tanmatsu BSP.
 - 12-band FFT, RMS, peak and beat analysis of the PCM that is sent to I2S.

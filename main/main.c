@@ -11,6 +11,7 @@
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
+#include "cJSON.h"
 #include "effects.h"
 #include "esp_check.h"
 #include "esp_lcd_mipi_dsi.h"
@@ -39,15 +40,9 @@
 #define NOW_CARD_Y      350
 #define NOW_CARD_W      376
 #define NOW_CARD_H      114
-#define SPLASH_W        72
-#define SPLASH_H        72
-#define SPLASH_FRAMES   15
-#define SPLASH_DURATION_US 2000000
 
 static const char *TAG = "musicplayer";
 
-extern const uint8_t splash_delta_start[] asm("_binary_splash_delta_bin_start");
-extern const uint8_t splash_delta_end[] asm("_binary_splash_delta_bin_end");
 
 typedef enum {
     SCREEN_LIBRARY,
@@ -137,12 +132,6 @@ static char lastfm_edit_api_key[80] = "";
 static char lastfm_edit_api_secret[80] = "";
 static char lastfm_edit_username[64] = "";
 static char lastfm_edit_password[96] = "";
-static volatile bool splash_finished = false;
-static volatile bool app_initialization_finished = false;
-static esp_err_t app_initialization_result = ESP_OK;
-static uint16_t splash_pixels[SPLASH_W * SPLASH_H];
-static size_t splash_decode_offset;
-static size_t splash_decoded_frames;
 
 static void change_effect_automatically(void);
 
@@ -159,72 +148,6 @@ static void present(pax_buf_t *buffer) {
     esp_err_t err = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(buffer));
     if (err != ESP_OK) ESP_LOGE(TAG, "Display blit failed: %s", esp_err_to_name(err));
     framebuffer_index ^= 1;
-}
-
-static pax_col_t rgb565_to_pax(uint16_t rgb565) {
-    uint8_t r = (uint8_t)(((rgb565 >> 11) & 0x1f) * 255 / 31);
-    uint8_t g = (uint8_t)(((rgb565 >> 5) & 0x3f) * 255 / 63);
-    uint8_t b = (uint8_t)((rgb565 & 0x1f) * 255 / 31);
-    return pax_col_rgb(r, g, b);
-}
-
-static uint16_t read_le16(const uint8_t *p) {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static uint32_t read_le32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static bool splash_decode_to(size_t frame) {
-    const size_t asset_size = (size_t)(splash_delta_end - splash_delta_start);
-    if (asset_size < 10 || memcmp(splash_delta_start, "DSPL", 4) != 0) return false;
-    if (read_le16(splash_delta_start + 4) != SPLASH_W || read_le16(splash_delta_start + 6) != SPLASH_H) return false;
-    size_t asset_frames = read_le16(splash_delta_start + 8);
-    if (asset_frames == 0) return false;
-    if (frame >= asset_frames) frame = asset_frames - 1;
-
-    if (splash_decode_offset == 0) {
-        memset(splash_pixels, 0, sizeof(splash_pixels));
-        splash_decode_offset = 10;
-        splash_decoded_frames = 0;
-    }
-    while (splash_decoded_frames <= frame) {
-        if (splash_decode_offset + 4 > asset_size) return false;
-        uint32_t record_bytes = read_le32(splash_delta_start + splash_decode_offset);
-        splash_decode_offset += 4;
-        if (splash_decode_offset + record_bytes > asset_size) return false;
-        size_t end = splash_decode_offset + record_bytes;
-        while (splash_decode_offset < end) {
-            if (splash_decode_offset + 4 > end) return false;
-            uint16_t start = read_le16(splash_delta_start + splash_decode_offset);
-            uint16_t count = read_le16(splash_delta_start + splash_decode_offset + 2);
-            splash_decode_offset += 4;
-            if ((size_t)start + count > SPLASH_W * SPLASH_H ||
-                splash_decode_offset + (size_t)count * 2 > end) return false;
-            for (uint16_t i = 0; i < count; i++) {
-                splash_pixels[start + i] = read_le16(splash_delta_start + splash_decode_offset + (size_t)i * 2);
-            }
-            splash_decode_offset += (size_t)count * 2;
-        }
-        splash_decoded_frames++;
-    }
-    return true;
-}
-
-static void render_splash_frame(size_t frame) {
-    if (!splash_decode_to(frame)) return;
-
-    pax_buf_t *buffer = &framebuffers[framebuffer_index];
-    pax_background(buffer, 0xff000000);
-    int x0 = (pax_buf_get_width(buffer) - SPLASH_W) / 2;
-    int y0 = (pax_buf_get_height(buffer) - SPLASH_H) / 2;
-    for (int y = 0; y < SPLASH_H; y++) {
-        for (int x = 0; x < SPLASH_W; x++) {
-            pax_set_pixel(buffer, rgb565_to_pax(splash_pixels[(size_t)y * SPLASH_W + x]), x0 + x, y0 + y);
-        }
-    }
-    present(buffer);
 }
 
 static void clipped_text(char *output, size_t output_size, const char *input, size_t max_chars) {
@@ -734,8 +657,14 @@ static void visual_setting_value(size_t index, char *value, size_t value_size) {
         case 6: strlcpy(value, palettes[settings.palette_index], value_size); break;
         case 7: strlcpy(value, colour_speeds[settings.palette_speed], value_size); break;
         case 8: snprintf(value, value_size, "%u%%", settings.brightness); break;
-        case 9: snprintf(value, value_size, "%u sec", settings.dim_timeout_seconds); break;
-        case 10: strlcpy(value, "Off", value_size); break;
+        case 9:
+            if (settings.dim_timeout_seconds == 0) strlcpy(value, "Off", value_size);
+            else snprintf(value, value_size, "%u sec", settings.dim_timeout_seconds);
+            break;
+        case 10:
+            if (settings.dim_brightness == 0) strlcpy(value, "Off", value_size);
+            else snprintf(value, value_size, "%u%%", settings.dim_brightness);
+            break;
         case 11: strlcpy(value, intensities[settings.visual_intensity], value_size); break;
         case 12: strlcpy(value, "Press Right", value_size); break;
         default: value[0] = '\0'; break;
@@ -1051,8 +980,7 @@ static void apply_settings(void) {
     if (settings.palette_mode > 2) settings.palette_mode = 1;
     if (settings.palette_index >= 18) settings.palette_index = 0;
     if (settings.palette_speed > 4) settings.palette_speed = 2;
-    if (settings.dim_timeout_seconds == 0) settings.dim_timeout_seconds = 120;
-    settings.dim_brightness = 0;
+    if (settings.dim_brightness > 50) settings.dim_brightness = 50;
     effects_set_intensity(settings.visual_intensity);
     effects_set_palette_controls(settings.palette_mode, settings.palette_index, settings.palette_speed);
     if (settings.auto_effect_mode == AUTO_EFFECT_OFF) effects_select((effect_id_t)settings.fixed_effect);
@@ -1078,7 +1006,8 @@ static void open_jellyfin_account(void) {
 static void change_visual_setting(int delta) {
     static const uint16_t seconds[] = {15, 30, 45, 60, 90, 120, 180};
     static const uint16_t beats[] = {8, 16, 32, 64, 96, 128};
-    static const uint16_t dim_times[] = {30, 60, 120, 300, 600};
+    static const uint16_t dim_times[] = {0, 30, 60, 120, 300, 600};
+    static const uint16_t dim_levels[] = {0, 10, 20, 30, 40, 50};
     switch (selected_setting) {
         case 0: settings.auto_effect_mode = (settings.auto_effect_mode + (delta > 0 ? 1 : 3)) % 4; break;
         case 1:
@@ -1098,7 +1027,7 @@ static void change_visual_setting(int delta) {
             break;
         }
         case 9: settings.dim_timeout_seconds = cycle_choice(settings.dim_timeout_seconds, dim_times, sizeof(dim_times) / sizeof(dim_times[0]), delta); break;
-        case 10: settings.dim_brightness = 0; break;
+        case 10: settings.dim_brightness = (uint8_t)cycle_choice(settings.dim_brightness, dim_levels, sizeof(dim_levels) / sizeof(dim_levels[0]), delta); break;
         case 11: settings.visual_intensity = (settings.visual_intensity + (delta > 0 ? 1 : 2)) % 3; break;
         case 12:
             display_dimmed = true;
@@ -1411,8 +1340,9 @@ static void update_timers(int64_t now, const audio_player_snapshot_t *player) {
         now - last_input_time >= (int64_t)settings.dim_timeout_seconds * 1000000) {
         display_dimmed = true;
         render_dirty = false;
-        ESP_LOGI(TAG, "Display off after %u sec idle", settings.dim_timeout_seconds);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(0));
+        ESP_LOGI(TAG, "Display %s after %u sec idle", settings.dim_brightness > 0 ? "dimmed" : "off",
+                 settings.dim_timeout_seconds);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.dim_brightness));
     }
     if (current_screen != SCREEN_NOW_PLAYING || player->state != AUDIO_PLAYER_PLAYING ||
         settings.auto_effect_mode == AUTO_EFFECT_OFF) return;
@@ -1457,7 +1387,83 @@ static esp_err_t initialize_display_and_bsp(void) {
     return bsp_input_get_queue(&input_queue);
 }
 
-static esp_err_t initialize_app_after_splash_start(void) {
+#define CONFIG_FILE_PATH "/sd/musicplayer/config.json"
+#define CONFIG_FILE_MAX_SIZE 4096
+
+// Lets a Last.fm account be provisioned by dropping a JSON file on the SD
+// card instead of typing API key/secret/username/password on the on-device
+// keyboard every time. Only applies when no session is stored yet, so it
+// won't repeatedly re-authenticate once login has succeeded.
+static void load_config_from_sd(void) {
+    FILE *file = fopen(CONFIG_FILE_PATH, "rb");
+    if (file == NULL) {
+        ESP_LOGI(TAG, "%s not found, skipping", CONFIG_FILE_PATH);
+        return;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0 || size > CONFIG_FILE_MAX_SIZE) {
+        fclose(file);
+        ESP_LOGW(TAG, "config.json ignored: bad size (%ld bytes)", size);
+        return;
+    }
+
+    char *buffer = malloc((size_t)size + 1);
+    if (buffer == NULL) {
+        fclose(file);
+        return;
+    }
+    size_t read = fread(buffer, 1, (size_t)size, file);
+    fclose(file);
+    buffer[read] = '\0';
+
+    // Skip a UTF-8 BOM: common when the file was saved with Notepad or
+    // PowerShell's Set-Content/Out-File, and cJSON treats it as garbage.
+    char *json_start = buffer;
+    if (read >= 3 && (uint8_t)buffer[0] == 0xEF && (uint8_t)buffer[1] == 0xBB && (uint8_t)buffer[2] == 0xBF) {
+        json_start += 3;
+    }
+
+    cJSON *root = cJSON_Parse(json_start);
+    if (root == NULL) {
+        const char *error = cJSON_GetErrorPtr();
+        ESP_LOGW(TAG, "config.json: invalid JSON near \"%.32s\"", error ? error : "?");
+        free(buffer);
+        return;
+    }
+    free(buffer);
+
+    cJSON *lastfm = cJSON_GetObjectItem(root, "lastfm");
+    lastfm_status_t status;
+    lastfm_scrobbler_get_status(&status);
+    if (cJSON_IsObject(lastfm) && !status.has_session) {
+        cJSON *api_key = cJSON_GetObjectItem(lastfm, "api_key");
+        cJSON *api_secret = cJSON_GetObjectItem(lastfm, "api_secret");
+        cJSON *username = cJSON_GetObjectItem(lastfm, "username");
+        cJSON *password = cJSON_GetObjectItem(lastfm, "password");
+        esp_err_t res = ESP_OK;
+        if (cJSON_IsString(api_key) && cJSON_IsString(api_secret) && api_key->valuestring[0] != '\0' &&
+            api_secret->valuestring[0] != '\0') {
+            res = lastfm_scrobbler_set_api_credentials(api_key->valuestring, api_secret->valuestring);
+        }
+        if (res == ESP_OK && cJSON_IsString(username) && cJSON_IsString(password) &&
+            username->valuestring[0] != '\0') {
+            res = lastfm_scrobbler_login(username->valuestring, password->valuestring);
+        }
+        if (res == ESP_OK) {
+            settings.lastfm_enabled = 1;
+            app_settings_save(&settings);
+            ESP_LOGI(TAG, "Last.fm credentials loaded from config.json");
+        } else {
+            ESP_LOGW(TAG, "config.json Last.fm login failed: %s", esp_err_to_name(res));
+        }
+    }
+    cJSON_Delete(root);
+}
+
+static esp_err_t initialize_app(void) {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -1470,8 +1476,7 @@ static esp_err_t initialize_app_after_splash_start(void) {
     if (settings.palette_mode > 2) settings.palette_mode = 1;
     if (settings.palette_index >= 18) settings.palette_index = 0;
     if (settings.palette_speed > 4) settings.palette_speed = 2;
-    if (settings.dim_timeout_seconds == 0) settings.dim_timeout_seconds = 120;
-    settings.dim_brightness = 0;
+    if (settings.dim_brightness > 50) settings.dim_brightness = 50;
     effects_init(pax_buf_get_width(&framebuffers[0]), pax_buf_get_height(&framebuffers[0]));
     effects_set_intensity(settings.visual_intensity);
     effects_set_palette_controls(settings.palette_mode, settings.palette_index, settings.palette_speed);
@@ -1487,56 +1492,20 @@ static esp_err_t initialize_app_after_splash_start(void) {
     if (err != ESP_OK) {
         snprintf(error_message, sizeof(error_message), "Audio initialization failed (%s)", esp_err_to_name(err));
         current_screen = SCREEN_ERROR;
-    } else {
-        reload_library();
+    } else if (reload_library() == ESP_OK) {
+        load_config_from_sd();
     }
     return ESP_OK;
-}
-
-static void app_initialization_task(void *arg) {
-    (void)arg;
-    app_initialization_result = initialize_app_after_splash_start();
-    if (app_initialization_result != ESP_OK) {
-        snprintf(error_message, sizeof(error_message), "App initialization failed (%s)",
-                 esp_err_to_name(app_initialization_result));
-        current_screen = SCREEN_ERROR;
-    }
-    app_initialization_finished = true;
-    vTaskDelete(NULL);
-}
-
-static void run_splash_until_ready(void) {
-    int64_t start = esp_timer_get_time();
-    size_t last_frame = SIZE_MAX;
-    bsp_input_event_t event;
-    while (!(splash_finished && app_initialization_finished)) {
-        while (xQueueReceive(input_queue, &event, 0) == pdTRUE) {
-        }
-        int64_t now = esp_timer_get_time();
-        int64_t elapsed = now - start;
-        size_t frame = (size_t)((elapsed * SPLASH_FRAMES) / SPLASH_DURATION_US);
-        if (frame >= SPLASH_FRAMES) {
-            frame = SPLASH_FRAMES - 1;
-            splash_finished = true;
-        }
-        if (frame != last_frame) {
-            render_splash_frame(frame);
-            last_frame = frame;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
 }
 
 void app_main(void) {
     ESP_ERROR_CHECK(initialize_display_and_bsp());
     ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(80));
-    render_splash_frame(0);
-    if (xTaskCreate(app_initialization_task, "app_loader", 16384, NULL, 4, NULL) != pdPASS) {
-        snprintf(error_message, sizeof(error_message), "App initialization task failed");
+    esp_err_t init_result = initialize_app();
+    if (init_result != ESP_OK) {
+        snprintf(error_message, sizeof(error_message), "App initialization failed (%s)", esp_err_to_name(init_result));
         current_screen = SCREEN_ERROR;
-        app_initialization_finished = true;
     }
-    run_splash_until_ready();
     ESP_ERROR_CHECK_WITHOUT_ABORT(bsp_display_set_backlight_brightness(settings.brightness ? settings.brightness : 80));
     render_dirty = true;
     now_card_valid[0] = false;
@@ -1553,11 +1522,11 @@ void app_main(void) {
 
         audio_player_event_t player_event;
         while (audio_player_poll_event(&player_event)) {
-            if (player_event.type == AUDIO_PLAYER_EVENT_FINISHED &&
-                (current_screen == SCREEN_NOW_PLAYING || current_screen == SCREEN_LIBRARY)) {
+            if (player_event.type == AUDIO_PLAYER_EVENT_FINISHED) {
                 screen_id_t previous_screen = current_screen;
                 play_relative(1);
-                if (previous_screen == SCREEN_LIBRARY) current_screen = SCREEN_LIBRARY;
+                current_screen = previous_screen;
+                render_dirty = true;
             } else if (player_event.type == AUDIO_PLAYER_EVENT_ERROR) {
                 strlcpy(error_message, player_event.message, sizeof(error_message));
                 render_dirty = true;

@@ -38,8 +38,6 @@ idf_component_register(
 		${extra_requires}
 	INCLUDE_DIRS
 		"."
-	EMBED_FILES
-		"splash_delta.bin"
 )
 
 idf_component_set_property(robotman2412__pax-gfx WHOLE_ARCHIVE TRUE)
