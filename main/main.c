@@ -389,6 +389,15 @@ static const char *state_name(audio_player_state_t state) {
     }
 }
 
+static void format_playback_time(char *out, size_t out_size, uint32_t seconds) {
+    uint32_t hours = seconds / 3600;
+    uint32_t minutes = (seconds / 60) % 60;
+    uint32_t remainder = seconds % 60;
+    if (hours > 0) snprintf(out, out_size, "%lu:%02lu:%02lu", (unsigned long)hours,
+                            (unsigned long)minutes, (unsigned long)remainder);
+    else snprintf(out, out_size, "%lu:%02lu", (unsigned long)(seconds / 60), (unsigned long)remainder);
+}
+
 static pax_col_t color_scale(pax_col_t color, float scale) {
     if (scale < 0.0f) scale = 0.0f;
     if (scale > 1.0f) scale = 1.0f;
@@ -565,12 +574,20 @@ static void render_now_playing(pax_buf_t *buffer, float dt) {
         pax_simple_rect(buffer, 0xff0d1020, NOW_CARD_X + NOW_CARD_W - 124,
                         NOW_CARD_Y + 6, 100, 17);
         pax_simple_rect(buffer, accent, NOW_CARD_X + 15, NOW_CARD_Y, trace_width, 2);
-        for (int band = 0; band < AUDIO_ANALYSIS_BANDS; band++) {
-            int height = 2 + (int)(analysis.bands[band] * 12.0f);
-            pax_simple_rect(buffer, band & 1 ? accent : secondary,
-                            NOW_CARD_X + NOW_CARD_W - 122 + band * 8,
-                            NOW_CARD_Y + 22 - height, 5, height);
+        char elapsed[16], remaining[16], playback_time[40];
+        format_playback_time(elapsed, sizeof(elapsed), player.elapsed_seconds);
+        if (player.duration_seconds > 0) {
+            uint32_t seconds_left = player.duration_seconds > player.elapsed_seconds
+                                        ? player.duration_seconds - player.elapsed_seconds
+                                        : 0;
+            format_playback_time(remaining, sizeof(remaining), seconds_left);
+            snprintf(playback_time, sizeof(playback_time), "%s  -%s", elapsed, remaining);
+        } else {
+            snprintf(playback_time, sizeof(playback_time), "%s  --:--", elapsed);
         }
+        pax_vec2f time_size = pax_text_size(pax_font_sky_mono, 9, playback_time);
+        pax_draw_text(buffer, color_scale(accent, .92f), pax_font_sky_mono, 9,
+                      NOW_CARD_X + NOW_CARD_W - 24 - time_size.x, NOW_CARD_Y + 8, playback_time);
         int active_segments = (player.volume + 9) / 10;
         pax_draw_text(buffer, color_scale(secondary, .75f), pax_font_sky_mono, 9,
                       NOW_CARD_X + NOW_CARD_W - 132, NOW_CARD_Y + NOW_CARD_H - 14, "VOL");
@@ -1283,9 +1300,7 @@ static void change_effect_automatically(void) {
     effect_id_t current = effects_current();
     if (settings.shuffle_effects && EFFECT_COUNT > 1) {
         effect_id_t next;
-        // The procedural bank is curated for strong visual differences. Keep
-        // automatic shuffle there; the older feedback/legacy bank remains
-        // reachable manually with F2/F3.
+        // Automatic shuffle uses the procedural effect bank.
         size_t procedural_count = EFFECT_COUNT - EFFECT_PROCEDURAL_FIRST;
         do {
             next = (effect_id_t)(EFFECT_PROCEDURAL_FIRST + esp_random() % procedural_count);
@@ -1390,10 +1405,7 @@ static esp_err_t initialize_display_and_bsp(void) {
 #define CONFIG_FILE_PATH "/sd/musicplayer/config.json"
 #define CONFIG_FILE_MAX_SIZE 4096
 
-// Lets a Last.fm account be provisioned by dropping a JSON file on the SD
-// card instead of typing API key/secret/username/password on the on-device
-// keyboard every time. Only applies when no session is stored yet, so it
-// won't repeatedly re-authenticate once login has succeeded.
+// Optional first-run Last.fm provisioning from the SD card.
 static void load_config_from_sd(void) {
     FILE *file = fopen(CONFIG_FILE_PATH, "rb");
     if (file == NULL) {
@@ -1419,8 +1431,7 @@ static void load_config_from_sd(void) {
     fclose(file);
     buffer[read] = '\0';
 
-    // Skip a UTF-8 BOM: common when the file was saved with Notepad or
-    // PowerShell's Set-Content/Out-File, and cJSON treats it as garbage.
+    // Skip an optional UTF-8 BOM.
     char *json_start = buffer;
     if (read >= 3 && (uint8_t)buffer[0] == 0xEF && (uint8_t)buffer[1] == 0xBB && (uint8_t)buffer[2] == 0xBF) {
         json_start += 3;
@@ -1428,8 +1439,7 @@ static void load_config_from_sd(void) {
 
     cJSON *root = cJSON_Parse(json_start);
     if (root == NULL) {
-        const char *error = cJSON_GetErrorPtr();
-        ESP_LOGW(TAG, "config.json: invalid JSON near \"%.32s\"", error ? error : "?");
+        ESP_LOGW(TAG, "config.json: invalid JSON");
         free(buffer);
         return;
     }

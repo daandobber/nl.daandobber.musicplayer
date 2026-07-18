@@ -1,5 +1,6 @@
 #include "audio_player.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,9 @@
 #define FLAC_STREAMINFO_SIZE 34
 #define FLAC_PREFIX_SIZE (4 + 4 + FLAC_STREAMINFO_SIZE)
 #define FLAC_MAX_METADATA_BLOCKS 128
+#define MP3_PROBE_SIZE 4096
+#define OGG_TAIL_SEARCH_SIZE (128 * 1024)
+#define OGG_SCAN_CHUNK_SIZE 4096
 
 static const char *TAG = "player";
 
@@ -67,6 +71,7 @@ static void snapshot_start(const char *path) {
     player_snapshot.channels = 0;
     player_snapshot.bits_per_sample = 0;
     player_snapshot.elapsed_seconds = 0;
+    player_snapshot.duration_seconds = 0;
     player_snapshot.error[0] = '\0';
     strlcpy(player_snapshot.path, path, sizeof(player_snapshot.path));
     xSemaphoreGive(snapshot_mutex);
@@ -112,15 +117,274 @@ static esp_audio_simple_dec_type_t decoder_type_for_path(const char *path) {
     return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
 }
 
+static void snapshot_set_duration(uint32_t duration_seconds) {
+    xSemaphoreTake(snapshot_mutex, portMAX_DELAY);
+    player_snapshot.duration_seconds = duration_seconds;
+    xSemaphoreGive(snapshot_mutex);
+}
+
 typedef struct {
     FILE *file;
     esp_http_client_handle_t http;
     bool is_http;
     long file_size;
+    uint32_t duration_seconds;
     uint8_t flac_prefix[FLAC_PREFIX_SIZE];
     size_t flac_prefix_length;
     size_t flac_prefix_offset;
 } player_input_t;
+
+static uint32_t read_be32(const uint8_t *value) {
+    return ((uint32_t)value[0] << 24) | ((uint32_t)value[1] << 16) | ((uint32_t)value[2] << 8) | value[3];
+}
+
+static uint32_t read_le32(const uint8_t *value) {
+    return (uint32_t)value[0] | ((uint32_t)value[1] << 8) | ((uint32_t)value[2] << 16) |
+           ((uint32_t)value[3] << 24);
+}
+
+static uint64_t read_le64(const uint8_t *value) {
+    return (uint64_t)read_le32(value) | ((uint64_t)read_le32(value + 4) << 32);
+}
+
+static uint32_t duration_ceil(uint64_t units, uint32_t units_per_second) {
+    if (units == 0 || units_per_second == 0) return 0;
+    uint64_t seconds = 1 + (units - 1) / units_per_second;
+    return seconds > UINT32_MAX ? UINT32_MAX : (uint32_t)seconds;
+}
+
+static uint32_t flac_streaminfo_duration(const uint8_t *streaminfo) {
+    uint32_t sample_rate = ((uint32_t)streaminfo[10] << 12) | ((uint32_t)streaminfo[11] << 4) |
+                           (streaminfo[12] >> 4);
+    uint64_t total_samples = ((uint64_t)(streaminfo[13] & 0x0f) << 32) |
+                             ((uint64_t)streaminfo[14] << 24) | ((uint64_t)streaminfo[15] << 16) |
+                             ((uint64_t)streaminfo[16] << 8) | streaminfo[17];
+    return duration_ceil(total_samples, sample_rate);
+}
+
+static uint32_t detect_wav_duration(FILE *file, long file_size) {
+    uint8_t header[12];
+    uint32_t byte_rate = 0;
+    uint32_t data_size = 0;
+    rewind(file);
+    if (fread(header, 1, sizeof(header), file) != sizeof(header) || memcmp(header, "RIFF", 4) != 0 ||
+        memcmp(header + 8, "WAVE", 4) != 0) {
+        rewind(file);
+        return 0;
+    }
+
+    for (size_t chunks = 0; chunks < 128 && (!byte_rate || !data_size); chunks++) {
+        uint8_t chunk[8];
+        if (fread(chunk, 1, sizeof(chunk), file) != sizeof(chunk)) break;
+        uint32_t size = read_le32(chunk + 4);
+        long data_start = ftell(file);
+        uint64_t next = data_start < 0 ? UINT64_MAX : (uint64_t)data_start + size + (size & 1u);
+        if (data_start < 0 || next > LONG_MAX || (file_size >= 0 && next > (uint64_t)file_size)) break;
+
+        if (memcmp(chunk, "fmt ", 4) == 0 && size >= 16) {
+            uint8_t format[16];
+            if (fread(format, 1, sizeof(format), file) != sizeof(format)) break;
+            byte_rate = read_le32(format + 8);
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            data_size = size;
+        }
+        if (byte_rate && data_size) break;
+        if (fseek(file, (long)next, SEEK_SET) != 0) break;
+    }
+    rewind(file);
+    return duration_ceil(data_size, byte_rate);
+}
+
+static uint32_t detect_ogg_vorbis_duration(FILE *file, long file_size) {
+    uint32_t sample_rate = 0;
+    uint32_t stream_serial = 0;
+    uint64_t last_granule = 0;
+    rewind(file);
+
+    // Bound the identification scan to avoid delaying playback.
+    for (size_t pages = 0; pages < 16 && sample_rate == 0; pages++) {
+        uint8_t header[27];
+        if (fread(header, 1, sizeof(header), file) != sizeof(header) || memcmp(header, "OggS", 4) != 0 ||
+            header[4] != 0) break;
+        uint8_t segment_count = header[26];
+        uint8_t lacing[255];
+        if (fread(lacing, 1, segment_count, file) != segment_count) break;
+        uint32_t body_size = 0;
+        for (uint16_t i = 0; i < segment_count; i++) body_size += lacing[i];
+
+        long body_start = ftell(file);
+        uint64_t body_end = body_start < 0 ? UINT64_MAX : (uint64_t)body_start + body_size;
+        if (body_start < 0 || body_end > LONG_MAX || (file_size >= 0 && body_end > (uint64_t)file_size)) break;
+
+        uint32_t serial = read_le32(header + 14);
+        if (sample_rate == 0 && body_size >= 30) {
+            uint8_t identification[30];
+            if (fread(identification, 1, sizeof(identification), file) != sizeof(identification)) break;
+            if (identification[0] == 1 && memcmp(identification + 1, "vorbis", 6) == 0 &&
+                read_le32(identification + 7) == 0 && identification[11] != 0) {
+                sample_rate = read_le32(identification + 12);
+                stream_serial = serial;
+            }
+        }
+        if (fseek(file, (long)body_end, SEEK_SET) != 0) break;
+    }
+
+    // An Ogg page is at most about 65 kB, so this tail contains the final page.
+    if (sample_rate && file_size > 0) {
+        uint8_t *scan = malloc(OGG_SCAN_CHUNK_SIZE);
+        if (scan != NULL) {
+            long search_start = file_size > OGG_TAIL_SEARCH_SIZE ? file_size - OGG_TAIL_SEARCH_SIZE : 0;
+            long last_page_offset = -1;
+            for (long position = search_start; position < file_size;) {
+                size_t wanted = (size_t)(file_size - position);
+                if (wanted > OGG_SCAN_CHUNK_SIZE) wanted = OGG_SCAN_CHUNK_SIZE;
+                if (fseek(file, position, SEEK_SET) != 0) break;
+                size_t received = fread(scan, 1, wanted, file);
+                if (received < 4) break;
+
+                for (size_t offset = 0; offset + 4 <= received; offset++) {
+                    if (memcmp(scan + offset, "OggS", 4) != 0) continue;
+                    long candidate = position + (long)offset;
+                    uint8_t header[27];
+                    if (fseek(file, candidate, SEEK_SET) != 0 ||
+                        fread(header, 1, sizeof(header), file) != sizeof(header) || header[4] != 0 ||
+                        read_le32(header + 14) != stream_serial) continue;
+                    uint8_t segment_count = header[26];
+                    uint8_t lacing[255];
+                    if (fread(lacing, 1, segment_count, file) != segment_count) continue;
+                    uint32_t body_size = 0;
+                    for (uint16_t i = 0; i < segment_count; i++) body_size += lacing[i];
+                    uint64_t page_end = (uint64_t)candidate + sizeof(header) + segment_count + body_size;
+                    uint64_t granule = read_le64(header + 6);
+                    if (page_end <= (uint64_t)file_size && granule != UINT64_MAX && candidate > last_page_offset) {
+                        last_page_offset = candidate;
+                        last_granule = granule;
+                    }
+                }
+                if (received <= 3) break;
+                position += (long)received - 3;  // Preserve split capture patterns.
+            }
+            free(scan);
+        }
+    }
+    rewind(file);
+    return duration_ceil(last_granule, sample_rate);
+}
+
+typedef struct {
+    uint32_t sample_rate;
+    uint32_t bitrate;
+    uint32_t frame_size;
+    uint16_t samples_per_frame;
+    uint8_t version_id;
+    bool mono;
+    bool has_crc;
+} mp3_frame_info_t;
+
+static bool parse_mp3_header(const uint8_t *bytes, mp3_frame_info_t *info) {
+    static const uint16_t mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
+    static const uint16_t mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+    static const uint32_t sample_rates[] = {44100, 48000, 32000};
+    uint32_t header = read_be32(bytes);
+    if ((header & 0xffe00000u) != 0xffe00000u) return false;
+    uint8_t version = (header >> 19) & 3;
+    uint8_t layer = (header >> 17) & 3;
+    uint8_t bitrate_index = (header >> 12) & 0x0f;
+    uint8_t rate_index = (header >> 10) & 3;
+    if (version == 1 || layer != 1 || bitrate_index == 0 || bitrate_index == 15 || rate_index == 3) return false;
+
+    uint32_t sample_rate = sample_rates[rate_index];
+    if (version == 2) sample_rate /= 2;
+    else if (version == 0) sample_rate /= 4;
+    uint32_t bitrate_kbps = version == 3 ? mpeg1_bitrates[bitrate_index] : mpeg2_bitrates[bitrate_index];
+    uint32_t frame_size = ((version == 3 ? 144000u : 72000u) * bitrate_kbps) / sample_rate +
+                          ((header >> 9) & 1);
+    if (frame_size < 4 || frame_size > MP3_PROBE_SIZE) return false;
+
+    *info = (mp3_frame_info_t){
+        .sample_rate = sample_rate,
+        .bitrate = bitrate_kbps * 1000,
+        .frame_size = frame_size,
+        .samples_per_frame = version == 3 ? 1152 : 576,
+        .version_id = version,
+        .mono = ((header >> 6) & 3) == 3,
+        .has_crc = ((header >> 16) & 1) == 0,
+    };
+    return true;
+}
+
+static uint32_t detect_mp3_duration(FILE *file, long file_size) {
+    if (file_size <= 0) return 0;
+    uint8_t *probe = malloc(MP3_PROBE_SIZE);
+    if (probe == NULL) return 0;
+    uint32_t duration = 0;
+    long audio_start = 0;
+
+    rewind(file);
+    uint8_t id3_header[10];
+    if (fread(id3_header, 1, sizeof(id3_header), file) == sizeof(id3_header) && memcmp(id3_header, "ID3", 3) == 0) {
+        uint32_t tag_size = ((uint32_t)(id3_header[6] & 0x7f) << 21) |
+                            ((uint32_t)(id3_header[7] & 0x7f) << 14) |
+                            ((uint32_t)(id3_header[8] & 0x7f) << 7) | (id3_header[9] & 0x7f);
+        uint64_t offset = 10u + (uint64_t)tag_size + ((id3_header[3] == 4 && (id3_header[5] & 0x10)) ? 10u : 0u);
+        if (offset >= (uint64_t)file_size || offset > LONG_MAX) goto done;
+        audio_start = (long)offset;
+    }
+
+    if (fseek(file, audio_start, SEEK_SET) != 0) goto done;
+    size_t probe_size = (size_t)(file_size - audio_start);
+    if (probe_size > MP3_PROBE_SIZE) probe_size = MP3_PROBE_SIZE;
+    probe_size = fread(probe, 1, probe_size, file);
+
+    size_t frame_offset = SIZE_MAX;
+    mp3_frame_info_t frame = {0};
+    for (size_t offset = 0; offset + 4 <= probe_size; offset++) {
+        mp3_frame_info_t candidate;
+        if (!parse_mp3_header(probe + offset, &candidate)) continue;
+        if (offset + candidate.frame_size + 4 <= probe_size) {
+            mp3_frame_info_t next;
+            if (!parse_mp3_header(probe + offset + candidate.frame_size, &next)) continue;
+        }
+        frame_offset = offset;
+        frame = candidate;
+        break;
+    }
+    if (frame_offset == SIZE_MAX) goto done;
+
+    long frame_start = audio_start + (long)frame_offset;
+    if (fseek(file, frame_start, SEEK_SET) != 0 ||
+        fread(probe, 1, frame.frame_size, file) != frame.frame_size) goto done;
+
+    size_t side_info = frame.version_id == 3 ? (frame.mono ? 17u : 32u) : (frame.mono ? 9u : 17u);
+    size_t xing_offset = 4u + (frame.has_crc ? 2u : 0u) + side_info;
+    if (xing_offset + 12 <= frame.frame_size &&
+        (memcmp(probe + xing_offset, "Xing", 4) == 0 || memcmp(probe + xing_offset, "Info", 4) == 0)) {
+        uint32_t flags = read_be32(probe + xing_offset + 4);
+        if (flags & 1) {
+            uint32_t frames = read_be32(probe + xing_offset + 8);
+            duration = duration_ceil((uint64_t)frames * frame.samples_per_frame, frame.sample_rate);
+        }
+    }
+    size_t vbri_offset = 4u + 32u;
+    if (duration == 0 && vbri_offset + 18 <= frame.frame_size && memcmp(probe + vbri_offset, "VBRI", 4) == 0) {
+        uint32_t frames = read_be32(probe + vbri_offset + 14);
+        duration = duration_ceil((uint64_t)frames * frame.samples_per_frame, frame.sample_rate);
+    }
+
+    if (duration == 0 && frame.bitrate) {
+        long audio_end = file_size;
+        if (file_size >= 128 && fseek(file, file_size - 128, SEEK_SET) == 0 && fread(probe, 1, 3, file) == 3 &&
+            memcmp(probe, "TAG", 3) == 0) audio_end -= 128;
+        if (audio_end > frame_start) {
+            duration = duration_ceil((uint64_t)(audio_end - frame_start) * 8, frame.bitrate);
+        }
+    }
+
+done:
+    free(probe);
+    rewind(file);
+    return duration;
+}
 
 static bool prepare_flac_input(player_input_t *input) {
     uint8_t marker[4];
@@ -145,6 +409,7 @@ static bool prepare_flac_input(player_input_t *input) {
         rewind(input->file);
         return false;
     }
+    input->duration_seconds = flac_streaminfo_duration(input->flac_prefix + 8);
 
     bool last_block = (block_header[0] & 0x80) != 0;
     for (size_t blocks = 1; !last_block && blocks < FLAC_MAX_METADATA_BLOCKS; blocks++) {
@@ -174,10 +439,7 @@ static bool prepare_flac_input(player_input_t *input) {
         return false;
     }
 
-    // The Espressif FLAC elementary-stream parser searches at most 512 kB
-    // after STREAMINFO for its first audio frame. Present a valid minimal
-    // FLAC header followed directly by audio frames, omitting comments,
-    // pictures, padding and seek tables that the decoder does not need.
+    // Strip optional metadata to stay within the parser's first-frame search limit.
     input->flac_prefix[4] = 0x80;  // STREAMINFO is now the last metadata block.
     input->flac_prefix_length = FLAC_PREFIX_SIZE;
     input->flac_prefix_offset = 0;
@@ -197,7 +459,22 @@ static esp_err_t input_open(const char *path, player_input_t *input) {
             input->file_size = ftell(input->file);
             rewind(input->file);
         }
-        if (decoder_type_for_path(path) == ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC) prepare_flac_input(input);
+        switch (decoder_type_for_path(path)) {
+            case ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:
+                prepare_flac_input(input);
+                break;
+            case ESP_AUDIO_SIMPLE_DEC_TYPE_WAV:
+                input->duration_seconds = detect_wav_duration(input->file, input->file_size);
+                break;
+            case ESP_AUDIO_SIMPLE_DEC_TYPE_OGG:
+                input->duration_seconds = detect_ogg_vorbis_duration(input->file, input->file_size);
+                break;
+            case ESP_AUDIO_SIMPLE_DEC_TYPE_MP3:
+                input->duration_seconds = detect_mp3_duration(input->file, input->file_size);
+                break;
+            default:
+                break;
+        }
         return ESP_OK;
     }
 
@@ -224,10 +501,10 @@ static esp_err_t input_open(const char *path, player_input_t *input) {
     esp_http_client_set_header(input->http, "X-Emby-Token", jellyfin_client_token());
     err = esp_http_client_open(input->http, 0);
     if (err == ESP_OK) {
-        int content_length = esp_http_client_fetch_headers(input->http);
+        int64_t content_length = esp_http_client_fetch_headers(input->http);
         int status = esp_http_client_get_status_code(input->http);
         if (status < 200 || status >= 300) err = ESP_FAIL;
-        ESP_LOGI(TAG, "Jellyfin stream HTTP %d, %d bytes", status, content_length);
+        ESP_LOGI(TAG, "Jellyfin stream HTTP %d, %lld bytes", status, (long long)content_length);
     }
     if (err != ESP_OK) {
         esp_http_client_cleanup(input->http);
@@ -311,9 +588,7 @@ static control_result_t wait_while_paused(bool *paused, char *replacement) {
 }
 
 static esp_err_t write_i2s(const void *data, size_t bytes) {
-    // The ES8156 + onboard amplifier clips on modern 0 dBFS masters even when
-    // the codec volume is turned down. Keep 6 dB of digital headroom, matching
-    // the proven audio path used by the other Tanmatsu media applications.
+    // Keep 6 dB of digital headroom in the ES8156/amplifier path.
     static int16_t scratch[I2S_WRITE_SAMPLES];
     const int16_t *cursor = data;
     size_t samples = bytes / sizeof(int16_t);
@@ -448,6 +723,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
     }
 
     snapshot_start(path);
+    snapshot_set_duration(source.duration_seconds);
     audio_analysis_reset();
     bool paused = false;
     bool format_ready = false;
@@ -512,6 +788,10 @@ static control_result_t decode_file(const char *path, char *replacement) {
                 if (!format_ready || latest.sample_rate != info.sample_rate || latest.channel != info.channel ||
                     latest.bits_per_sample != info.bits_per_sample) {
                     info = latest;
+                    if (!source.is_http && source.duration_seconds == 0 && source.file_size > 0 && info.bitrate > 0) {
+                        source.duration_seconds = duration_ceil((uint64_t)source.file_size * 8, info.bitrate);
+                        snapshot_set_duration(source.duration_seconds);
+                    }
                     if ((info.bits_per_sample != 8 && info.bits_per_sample != 16 && info.bits_per_sample != 24 &&
                          info.bits_per_sample != 32) ||
                         (info.channel != 1 && info.channel != 2)) {
@@ -537,11 +817,7 @@ static control_result_t decode_file(const char *path, char *replacement) {
                 }
             }
 
-            // A simple decoder may first return a frame that was assembled
-            // from its internal cache without consuming the newly supplied
-            // input. Keep offering that same input until it is consumed;
-            // overwriting it with the next SD-card chunk corrupts frame sync,
-            // especially for FLAC frames larger than INPUT_CHUNK_SIZE.
+            // Preserve input while the decoder emits internally cached PCM.
             if (raw.consumed == 0 && output.decoded_size == 0) {
                 set_error("Decoder made no progress");
                 failed = true;
@@ -610,8 +886,7 @@ esp_err_t audio_player_init(void) {
     ESP_RETURN_ON_ERROR(bsp_audio_set_volume(player_snapshot.volume), TAG, "Volume init failed");
     ESP_RETURN_ON_ERROR(bsp_audio_set_amplifier(true), TAG, "Amplifier init failed");
 
-    // Keep decoding and FFT work on core 1 so core 0 remains available for the
-    // display/UI loop. Audio has priority over the lower-priority analyzer.
+    // Reserve core 0 for the display loop.
     if (xTaskCreatePinnedToCore(player_task, "audio-player", 10240, NULL, 8, NULL, 1) != pdPASS) return ESP_ERR_NO_MEM;
     return ESP_OK;
 }

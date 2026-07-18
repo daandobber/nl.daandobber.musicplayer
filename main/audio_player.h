@@ -30,6 +30,7 @@ typedef struct {
     uint8_t              channels;
     uint8_t              bits_per_sample;
     uint32_t             elapsed_seconds;
+    uint32_t             duration_seconds;
     uint8_t              volume;
     char                 path[AUDIO_PLAYER_PATH_MAX];
     char                 error[96];

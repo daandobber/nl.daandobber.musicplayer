@@ -30,13 +30,7 @@ esp_err_t wifi_setup_init(void) {
     return ESP_OK;
 }
 
-// Multiple independent subsystems (audio streaming, Jellyfin, Last.fm) can
-// want the connection at overlapping times. wifi_connection_connect()
-// unconditionally tears down and restarts the radio, and disconnect() stops
-// it outright, so without reference counting one caller finishing its
-// request would yank the connection out from under another caller still
-// mid-stream/mid-request. Only the first caller actually connects; only the
-// last caller to release actually disconnects.
+// Share one connection across overlapping network users.
 bool wifi_setup_connect_blocking(uint32_t timeout_ms) {
     (void)timeout_ms;
     if (!s_radio_ok) return false;
